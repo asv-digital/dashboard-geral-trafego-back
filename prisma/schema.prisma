@@ -1,0 +1,713 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AUTH — User + Session
+// ═══════════════════════════════════════════════════════════════
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  name         String
+  passwordHash String
+  role         String    @default("editor") // owner | editor | viewer
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  sessions Session[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// GLOBAL SETTINGS — singleton, guarda credenciais Meta/Kirvano/etc
+// ═══════════════════════════════════════════════════════════════
+
+model GlobalSettings {
+  id                   String    @id @default("singleton")
+  metaAccessToken      String?
+  metaTokenCreatedAt   DateTime?
+  metaAdAccountId      String?
+  metaAppId            String?
+  metaAppSecret        String?
+  metaPixelId          String?
+  metaPageId           String?
+  metaAudienceBuyersId String?
+  metaAudienceWarmId   String?
+  metaAudienceWarmName String?
+  kirvanoWebhookToken  String?
+  anthropicApiKey      String?
+  updatedAt            DateTime  @updatedAt
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PRODUCT — unidade central de tudo
+// ═══════════════════════════════════════════════════════════════
+
+model Product {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  name        String
+  description String?
+  status      String   @default("active") // active | paused | archived
+
+  stage String @default("launch") // launch | evergreen | escalavel | nicho
+
+  // Econômica
+  priceGross          Float
+  gatewayFeeRate      Float  @default(0.035)
+  netPerSale          Float
+  mentoriaUpsellValue Float?
+  mentoriaUpsellRate  Float?
+
+  // Orçamento
+  dailyBudgetTarget Float
+  dailyBudgetFloor  Float
+  dailyBudgetCap    Float
+  pacingStrategy    String @default("even")
+
+  // Meta scoping (null = herda do GlobalSettings)
+  metaPixelId          String?
+  metaPageId           String?
+  metaAudienceBuyersId String?
+
+  // Kirvano
+  kirvanoProductId String @unique
+
+  // Landing & copies default
+  landingUrl         String
+  defaultHeadline    String
+  defaultDescription String?
+  defaultCTA         String @default("LEARN_MORE")
+  utmNaming          String?
+
+  supervisedMode Boolean @default(false)
+
+  // Auto-activate campanhas criadas pelo planner.
+  // false (default): cria PAUSED — humano revisa e ativa manualmente
+  // true: ativa imediatamente após criar no Meta
+  autoActivate Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  automationConfig    ProductAutomationConfig?
+  heartbeat           AgentHeartbeat?
+  campaigns           Campaign[]
+  metrics             MetricEntry[]
+  sales               Sale[]
+  creatives           Creative[]
+  assets              ProductAsset[]
+  cartAbandonments    CartAbandonment[]
+  dailySnapshots      DailySnapshot[]
+  placementMetrics    PlacementMetric[]
+  actionLogs          ActionLog[]
+  monthlyGoals        MonthlyGoal[]
+  adDiagnostics       AdDiagnostic[]
+  automationLocks     AutomationLock[]
+  alertDedups         AlertDedup[]
+  cpmTrends           CPMTrend[]
+  adComments          AdComment[]
+  adCommentSummaries  AdCommentSummary[]
+  lookalikeAudiences  LookalikeAudience[]
+  creativeTests       CreativeTest[]
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PRODUCT ASSET — criativos upados (vídeo, imagem, copy, headline)
+// Upload vai pra R2/S3-compat; metaCreativeId setado após subir no Meta.
+// ═══════════════════════════════════════════════════════════════
+
+model ProductAsset {
+  id             String   @id @default(cuid())
+  productId      String
+  type           String   // image | video | copy | headline | hook
+  name           String
+  originalUrl    String?  // URL R2 (pra mídia)
+  r2Key          String?  // chave no bucket R2 (pra mídia)
+  content        String?  // conteúdo textual (pra copy/headline/hook)
+  metaMediaId    String?  // video_id ou image_hash no Meta
+  metaCreativeId String?  // adcreative_id depois de previewCreative
+  status         String   @default("uploaded") // uploaded | ready | failed | retired
+  mimeType       String?
+  sizeBytes      Int?
+  tags           String?  // CSV: hook,problem,solution
+  uploadedBy     String?  // userId
+  error          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId, status])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PRODUCT AUTOMATION CONFIG
+// ═══════════════════════════════════════════════════════════════
+
+model ProductAutomationConfig {
+  id        String @id @default(cuid())
+  productId String @unique
+
+  autoPauseNoSales    Boolean @default(true)
+  autoPauseSpendLimit Float   @default(200)
+  autoPauseBreakeven  Boolean @default(true)
+  breakevenCPA        Float
+  breakevenMinDays    Int     @default(3)
+
+  autoScaleWinners      Boolean @default(true)
+  autoScaleCPAThreshold Float
+  autoScalePercent      Float   @default(20)
+  autoScaleMinDays      Int     @default(3)
+  autoScaleMaxBudget    Float
+
+  respectLearningPhase Boolean @default(true)
+  learningPhaseHours   Int     @default(72)
+
+  autoRotateCreatives Boolean @default(true)
+  cpaPauseThreshold   Float
+  notifyOnAutoAction  Boolean @default(true)
+
+  autoPauseFrequency        Boolean @default(true)
+  frequencyLimitProspection Float   @default(3.0)
+  frequencyLimitRemarketing Float   @default(6.0)
+
+  budgetCapProspection   Float
+  budgetCapRemarketing   Float
+  budgetCapASC           Float
+  budgetFloorProspection Float
+  budgetFloorRemarketing Float
+
+  daypartingEnabled Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CAMPAIGN — gerenciada pelo agente
+// metaCampaignId é a whitelist: agente só toca em campanhas que
+// ele mesmo criou (ou que foram linkadas explicitamente).
+// ═══════════════════════════════════════════════════════════════
+
+enum CampaignStatus {
+  Ativa
+  Pausada
+  Arquivada
+}
+
+model Campaign {
+  id        String @id @default(cuid())
+  productId String
+
+  name              String
+  type              String // Prospecção | Remarketing | ASC
+  audience          String?
+  dailyBudget       Float
+  startDate         DateTime
+  status            CampaignStatus @default(Ativa)
+  metaCampaignId    String?
+
+  createdInMetaAt   DateTime?
+  learningPhaseEnd  DateTime?
+  isInLearningPhase Boolean   @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  product   Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+  metrics   MetricEntry[]
+  creatives Creative[]
+  sales     Sale[]
+
+  @@unique([productId, metaCampaignId])
+  @@index([productId, status])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// METRIC ENTRY — insights consolidados por campanha + adset + data
+// ═══════════════════════════════════════════════════════════════
+
+model MetricEntry {
+  id         String @id @default(cuid())
+  productId  String
+  campaignId String
+  date       DateTime
+  adSet      String?
+
+  investment  Float
+  impressions Int
+  clicks      Int
+  sales       Int      @default(0)
+  frequency   Float    @default(0)
+  hookRate    Float?
+  observations String?
+
+  // Funil
+  landingPageViews       Int?
+  initiateCheckouts      Int?
+  addToCart              Int?
+  costPerPageView        Float?
+  costPerCheckout        Float?
+  costPerLandingPageView Float?
+  clickToPageViewRate    Float?
+  pageViewToCheckout     Float?
+  checkoutToSaleRate     Float?
+  outboundClicks         Int?
+  outboundCtr            Float?
+  threeSecondViews       Int?
+  videoPlays             Int?
+  thruplayViews          Int?
+  thruplayRate           Float?
+
+  createdAt DateTime @default(now())
+
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, campaignId, date, adSet])
+  @@index([productId, date])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CREATIVE
+// ═══════════════════════════════════════════════════════════════
+
+model Creative {
+  id           String @id @default(cuid())
+  productId    String
+  campaignId   String?
+  name         String
+  type         String // video | image | carousel
+  status       String @default("active") // active | paused | exhausted
+  ctr          Float?
+  hookRate     Float?
+  cpa          Float?
+  thruplayRate Float?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  product  Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  campaign Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+
+  @@index([productId, status])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SALE — vindo do webhook Kirvano
+// kirvanoTxId é unique GLOBAL (não por produto) pra evitar
+// webhooks duplicados independente do produto.
+// ═══════════════════════════════════════════════════════════════
+
+model Sale {
+  id          String   @id @default(cuid())
+  productId   String
+  campaignId  String?
+  date        DateTime
+  amountGross Float
+  amountNet   Float
+  paymentMethod String?
+  status        String @default("approved") // approved | pending | refunded | chargeback
+
+  utmSource   String?
+  utmMedium   String?
+  utmCampaign String?
+  utmContent  String?
+  utmTerm     String?
+
+  metaCampaignId String?
+  metaAdsetId    String?
+  metaAdId       String?
+
+  customerEmail     String?
+  customerPhone     String?
+  customerName      String?
+  customerFirstName String?
+  customerLastName  String?
+
+  kirvanoTxId       String  @unique
+  kirvanoCheckoutId String?
+
+  capiSent    Boolean  @default(false)
+  capiSentAt  DateTime?
+  capiEventId String?
+
+  convertedToMentoria Boolean   @default(false)
+  mentoriaConvertedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  product  Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  campaign Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+
+  @@index([productId, date, status])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CART ABANDONMENT
+// ═══════════════════════════════════════════════════════════════
+
+model CartAbandonment {
+  id             String  @id @default(cuid())
+  productId      String
+  date           DateTime
+  customerEmail  String?
+  customerPhone  String?
+  customerName   String?
+  kirvanoProductId String?
+  utmSource      String?
+  utmCampaign    String?
+  utmContent     String?
+  checkoutUrl    String?
+  recovered      Boolean @default(false)
+  createdAt      DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId, date])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DAILY SNAPSHOT — snapshot único por produto+data
+// ═══════════════════════════════════════════════════════════════
+
+model DailySnapshot {
+  id                 String   @id @default(cuid())
+  productId          String
+  date               DateTime
+  totalSpend         Float
+  totalSales         Int
+  totalRevenue       Float
+  avgCpa             Float?
+  avgRoas            Float?
+  avgCtr             Float?
+  avgCpm             Float?
+  avgFrequency       Float?
+  hookRate           Float?
+  cplpv              Float?
+  outboundCtr        Float?
+  campaignBreakdown  Json?
+  collectedAt        DateTime @default(now())
+  source             String   @default("scheduler")
+  createdAt          DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, date])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PLACEMENT METRIC
+// ═══════════════════════════════════════════════════════════════
+
+model PlacementMetric {
+  id             String   @id @default(cuid())
+  productId      String
+  date           DateTime
+  campaignId     String?
+  adsetId        String?
+  platform       String?
+  position       String?
+  impressions    Int
+  spend          Float
+  cpm            Float?
+  clicks         Int
+  outboundClicks Int?
+  conversions    Int      @default(0)
+  cpa            Float?
+  createdAt      DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId, date])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ACTION LOG
+// ═══════════════════════════════════════════════════════════════
+
+model ActionLog {
+  id          String   @id @default(cuid())
+  productId   String
+  action      String
+  entityType  String?  // campaign | adset | creative | ad
+  entityId    String?
+  entityName  String?
+  details     String?
+  // Trading journal enriquecido: reasoning em linguagem natural + snapshot
+  // do input que levou à decisão + outcome retroativo (populado depois).
+  reasoning     String?
+  inputSnapshot Json?
+  outcome       Json?
+  source      String   @default("system") // dashboard | system | webhook
+  executedAt  DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId, executedAt])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MONTHLY GOAL
+// ═══════════════════════════════════════════════════════════════
+
+model MonthlyGoal {
+  id           String   @id @default(cuid())
+  productId    String
+  month        String   // YYYY-MM
+  targetSales  Int
+  targetCpa    Float?
+  targetRoas   Float?
+  targetProfit Float?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, month])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AD DIAGNOSTIC — quality/engagement/conversion rankings
+// ═══════════════════════════════════════════════════════════════
+
+model AdDiagnostic {
+  id                String   @id @default(cuid())
+  productId         String
+  date              DateTime
+  adId              String
+  adName            String
+  adsetId           String
+  campaignId        String
+  qualityRanking    String
+  engagementRanking String
+  conversionRanking String
+  spend             Float
+  cpa               Float?
+  createdAt         DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, date, adId])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AUTOMATION LOCK — coordenação entre services
+// Locks são escopados por produto
+// ═══════════════════════════════════════════════════════════════
+
+model AutomationLock {
+  id            String   @id @default(cuid())
+  productId     String
+  entityType    String   // adset | campaign
+  entityId      String
+  lockedBy      String   // auto_executor | budget_rebalancer | dayparting | ab_resolver
+  action        String   // scale | pause | budget_change | daypart_reduce | daypart_restore
+  previousValue String?
+  newValue      String?
+  expiresAt     DateTime
+  createdAt     DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, entityType, entityId])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AGENT HEARTBEAT — 1 por produto
+// ═══════════════════════════════════════════════════════════════
+
+model AgentHeartbeat {
+  productId            String    @id
+  lastCollectionAt     DateTime?
+  lastSnapshotAt       DateTime?
+  lastAutomationAt     DateTime?
+  consecutiveFailures  Int       @default(0)
+  lastError            String?
+  updatedAt            DateTime  @updatedAt
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ALERT DEDUP — key escopada por produto
+// ═══════════════════════════════════════════════════════════════
+
+model AlertDedup {
+  id         String   @id @default(cuid())
+  productId  String
+  key        String
+  lastState  String
+  lastSentAt DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, key])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CPM TREND
+// ═══════════════════════════════════════════════════════════════
+
+model CPMTrend {
+  id               String   @id @default(cuid())
+  productId        String
+  date             DateTime
+  avgCPM           Float
+  avgCTR           Float
+  avgCPA           Float
+  totalSpend       Float
+  totalImpressions Int
+  note             String?
+  createdAt        DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, date])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AD COMMENTS + SUMMARY
+// ═══════════════════════════════════════════════════════════════
+
+model AdComment {
+  id         String    @id @default(cuid())
+  productId  String
+  adId       String
+  adName     String?
+  commentId  String    @unique
+  message    String
+  authorName String?
+  sentiment  String?   // positive | negative | objection_price | objection_trust | question | tag_friend | neutral
+  createdAt  DateTime  @default(now())
+  analyzedAt DateTime?
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId, adId])
+}
+
+model AdCommentSummary {
+  id              String   @id @default(cuid())
+  productId       String
+  adId            String
+  adName          String?
+  period          String   // 7d | 30d
+  totalComments   Int
+  positive        Int
+  negative        Int
+  objectionPrice  Int
+  objectionTrust  Int
+  questions       Int
+  tagFriend       Int
+  neutral         Int
+  topObjection    String?
+  recommendation  String?
+  analyzedAt      DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, adId, period])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// LOOKALIKE AUDIENCE
+// ═══════════════════════════════════════════════════════════════
+
+model LookalikeAudience {
+  id                   String   @id @default(cuid())
+  productId            String
+  name                 String
+  metaAudienceId       String?
+  sourceAudienceId     String?
+  percentage           Int      // 1 | 2 | 3 | 5
+  buyerCountAtCreation Int
+  status               String   @default("created") // created | testing | active | paused
+  testAdsetId          String?
+  createdAt            DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CREATIVE TEST (A/B)
+// ═══════════════════════════════════════════════════════════════
+
+model CreativeTest {
+  id                 String    @id @default(cuid())
+  productId          String
+  name               String
+  status             String    @default("running") // running | concluded
+  adsetId            String
+  variantA           Json
+  variantB           Json
+  startDate          DateTime
+  endDate            DateTime?
+  minDays            Int       @default(5)
+  minSpendPerVariant Float     @default(100)
+  winner             String?
+  confidence         Float?
+  decidedAt          DateTime?
+  createdAt          DateTime  @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId, status])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// NOTIFICATION CONFIG + LOG (global, compartilhado entre produtos)
+// ═══════════════════════════════════════════════════════════════
+
+model NotificationConfig {
+  id                  String   @id @default("singleton")
+  whatsappProvider    String?
+  whatsappInstanceId  String?
+  whatsappToken       String?
+  whatsappPhone       String?
+  enabled             Boolean  @default(true)
+  notifyAutoActions   Boolean  @default(true)
+  notifyCreativeActions Boolean @default(true)
+  notifyLearningPhase Boolean  @default(true)
+  notifyAlerts        Boolean  @default(true)
+  notifyDailySummary  Boolean  @default(true)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+}
+
+model NotificationLog {
+  id        String   @id @default(cuid())
+  productId String?
+  type      String   // auto_action | creative | learning_phase | alert | daily_summary
+  message   String
+  channel   String   @default("whatsapp")
+  status    String   @default("sent")
+  error     String?
+  createdAt DateTime @default(now())
+
+  @@index([productId, createdAt])
+}

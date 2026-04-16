@@ -1,0 +1,44 @@
+{
+  "name": "dashboard-geral-trafego-back",
+  "version": "0.1.0",
+  "description": "Agente de tráfego multi-produto — backend",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "test": "tsx --test tests/*.test.ts",
+    "start": "node dist/server.js",
+    "db:generate": "prisma generate",
+    "db:push": "prisma db push",
+    "db:migrate": "prisma migrate dev",
+    "db:seed": "tsx prisma/seed.ts",
+    "db:studio": "prisma studio"
+  },
+  "type": "commonjs",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.87.0",
+    "@aws-sdk/client-s3": "^3.699.0",
+    "@aws-sdk/s3-request-presigner": "^3.699.0",
+    "@prisma/adapter-pg": "^7.6.0",
+    "@prisma/client": "^7.6.0",
+    "@types/multer": "^2.1.0",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.1",
+    "express": "^5.2.1",
+    "form-data": "^4.0.5",
+    "multer": "^2.1.1",
+    "pg": "^8.20.0",
+    "prisma": "^7.6.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.5.2",
+    "@types/pg": "^8.20.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}
