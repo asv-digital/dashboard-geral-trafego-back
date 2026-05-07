@@ -6,3 +6,6 @@ generated
 *.log
 .DS_Store
 prisma/migrations/dev.db*
+
+# Claude Code (local-only overrides)
+.claude/settings.local.json
