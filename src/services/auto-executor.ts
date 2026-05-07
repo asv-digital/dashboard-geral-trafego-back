@@ -627,6 +627,40 @@ export async function executeAutomationsForProduct(productId: string): Promise<v
         lastN.every(d => d.sales > 0 && d.cpa > 0 && d.cpa < cfg.autoScaleCPAThreshold);
       const qualityGate = evaluateScaleQuality(s.campaignName, lastN, cfg, product.stage as ProductStage);
       if (allBelowThreshold && qualityGate.allowed && s.dailyBudget < cfg.autoScaleMaxBudget) {
+        // Cooldown 72h: regra de mercado "+20% no máximo a cada 3 dias".
+        // O AutomationLock do auto_executor expira em 4h (rotina de pause/scale geral),
+        // mas escalar adset 2× em 72h reseta a learning phase no Meta. Por isso
+        // checamos o ActionLog: se houve auto_scale do mesmo adset há menos de 72h, pula.
+        const SCALE_COOLDOWN_MS = 72 * 60 * 60 * 1000;
+        const lastScale = await prisma.actionLog.findFirst({
+          where: {
+            productId,
+            action: "auto_scale",
+            entityType: "adset",
+            entityId: s.adsetId,
+            executedAt: { gt: new Date(Date.now() - SCALE_COOLDOWN_MS) },
+          },
+          orderBy: { executedAt: "desc" },
+        });
+        if (lastScale) {
+          const hoursSince = (Date.now() - lastScale.executedAt.getTime()) / 3_600_000;
+          await logAction({
+            productId,
+            action: "auto_scale_skipped_cooldown",
+            entityType: "adset",
+            entityId: s.adsetId,
+            entityName: s.adsetName,
+            details: `Cooldown 72h ativo: último scale há ${hoursSince.toFixed(1)}h`,
+            reasoning: `Adset preenche os critérios pra escalar (CPA < R$${cfg.autoScaleCPAThreshold} por ${cfg.autoScaleMinDays}d, qualidade ok), mas houve auto_scale há ${hoursSince.toFixed(1)}h. Escalar de novo dentro de 72h reseta a learning phase do Meta. Aguardando completar 72h pro próximo scale.`,
+            inputSnapshot: {
+              lastScaleAt: lastScale.executedAt,
+              hoursSinceLastScale: hoursSince,
+              cooldownHours: 72,
+            },
+          });
+          continue;
+        }
+
         const lock = await canAutomate(productId, "adset", s.adsetId, "auto_executor");
         if (!lock.allowed) continue;
 

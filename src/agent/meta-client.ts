@@ -3,6 +3,12 @@ import type { MetaInsight, MetaPaginatedResponse } from "./types";
 const API_VERSION = process.env.META_GRAPH_VERSION || "v19.0";
 const BASE_URL = `https://graph.facebook.com/${API_VERSION}`;
 
+// Janela de atribuição explícita: 7d post-click + 1d post-view (default Meta
+// pós-iOS14, padrão de mercado pra decisões de gestão). Sem isso a conta-nível
+// pode estar em "unified" ou outro default e cada conta lê janela diferente —
+// auto-pause/scale ficariam decidindo em dado que o gestor não controla.
+const ATTRIBUTION_WINDOWS = JSON.stringify(["7d_click", "1d_view"]);
+
 const INSIGHT_FIELDS = [
   "campaign_name",
   "campaign_id",
@@ -94,6 +100,7 @@ export class MetaClient {
       time_increment: "1",
       limit: "500",
       filtering,
+      action_attribution_windows: ATTRIBUTION_WINDOWS,
       access_token: this.token,
     });
 
@@ -148,6 +155,7 @@ export class MetaClient {
       breakdowns: "publisher_platform,platform_position",
       limit: "500",
       filtering,
+      action_attribution_windows: ATTRIBUTION_WINDOWS,
       access_token: this.token,
     });
 

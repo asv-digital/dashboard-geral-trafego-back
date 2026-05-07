@@ -34,7 +34,19 @@ app.use(
     credentials: true,
   })
 );
-app.use(express.json({ limit: "10mb" }));
+// raw body capturado em rotas de webhook pra HMAC SHA-256.
+// Body parseado normalmente pra todas as rotas. Overhead é só uma cópia
+// do buffer pra string em rotas que começam com /api/webhooks.
+app.use(
+  express.json({
+    limit: "10mb",
+    verify: (req, _res, buf) => {
+      if (req.url?.startsWith("/api/webhooks")) {
+        (req as any).rawBody = buf.toString("utf8");
+      }
+    },
+  })
+);
 app.use("/uploads", express.static(getLocalUploadsRoot()));
 
 // Webhooks antes do auth pra não exigir sessão

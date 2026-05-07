@@ -11,6 +11,13 @@ import {
   getResolvedGlobalSettings,
   getResolvedProductMetaSettings,
 } from "../lib/runtime-config";
+import {
+  timingSafeStringEqual,
+  verifyHmacSha256,
+  getClientIp,
+  isAllowedIp,
+  rateLimitWebhook,
+} from "../lib/webhook-security";
 
 const router = Router();
 
@@ -110,25 +117,67 @@ function resolveSaleDate(payload: any, txId: string | undefined): Date {
 }
 
 router.post("/kirvano", async (req: Request, res: Response) => {
+  const clientIp = getClientIp(req);
+
+  // Camada 1: rate-limit por IP. Kirvano nunca dispara em rajada (>60/min);
+  // se passar disso é ataque ou loop. Default 60/min, override via env.
+  const rl = rateLimitWebhook(`kirvano:${clientIp}`);
+  if (!rl.allowed) {
+    console.warn(`[webhook] rate-limit excedido ip=${clientIp}`);
+    res.status(429).json({ error: "rate_limited" });
+    return;
+  }
+
+  // Camada 2: IP allow-list opcional. Se KIRVANO_WEBHOOK_ALLOWED_IPS estiver
+  // setado (CSV), só aceita requests vindos desses IPs.
+  if (!isAllowedIp(req, process.env.KIRVANO_WEBHOOK_ALLOWED_IPS)) {
+    console.warn(`[webhook] IP fora da allow-list: ${clientIp}`);
+    res.status(403).json({ error: "forbidden_ip" });
+    return;
+  }
+
   const payload = req.body || {};
   const globalSettings = await getResolvedGlobalSettings();
 
-  // Validação de token. Se não houver token configurado, em produção aceita
-  // mas grita alto no log (um ataque que adivinhe URL e productId consegue
-  // injetar sale). Em dev é ok sem token pra facilitar curl local.
+  // Camada 3: HMAC SHA-256 opcional. Se KIRVANO_WEBHOOK_HMAC_SECRET estiver
+  // setado, exige header x-kirvano-signature (ou x-hub-signature-256) com
+  // assinatura do raw body. Mais forte que token-comparison porque body
+  // não pode ser modificado em trânsito.
+  const hmacSecret = process.env.KIRVANO_WEBHOOK_HMAC_SECRET;
+  if (hmacSecret) {
+    const signature =
+      (req.headers["x-kirvano-signature"] as string | undefined) ||
+      (req.headers["x-hub-signature-256"] as string | undefined);
+    const rawBody = (req as any).rawBody as string | undefined;
+    if (!signature || !rawBody) {
+      console.warn(`[webhook] HMAC habilitado mas request sem signature/rawBody (ip=${clientIp})`);
+      res.status(401).json({ error: "missing_signature" });
+      return;
+    }
+    if (!verifyHmacSha256(rawBody, signature, hmacSecret)) {
+      console.warn(`[webhook] HMAC invalido ip=${clientIp}`);
+      res.status(401).json({ error: "invalid_signature" });
+      return;
+    }
+  }
+
+  // Camada 4: token shared-secret (timing-safe compare).
+  // Se não houver token configurado em produção, rejeita. Em dev aceita
+  // pra facilitar curl local.
   const expected = globalSettings.kirvanoWebhookToken;
   if (expected) {
     const provided =
-      req.headers["x-kirvano-token"] ||
-      req.headers["x-webhook-token"] ||
-      req.query.token;
-    if (provided !== expected) {
+      (req.headers["x-kirvano-token"] as string | undefined) ||
+      (req.headers["x-webhook-token"] as string | undefined) ||
+      (typeof req.query.token === "string" ? req.query.token : undefined);
+    if (!provided || !timingSafeStringEqual(provided, expected)) {
       res.status(401).json({ error: "invalid_token" });
       return;
     }
-  } else if (process.env.NODE_ENV === "production") {
+  } else if (process.env.NODE_ENV === "production" && !hmacSecret) {
+    // Sem token nem HMAC em produção = porta aberta. Recusa.
     console.error(
-      "[webhook] CRITICAL: Kirvano sem token configurado em produção. Rejeitando request. Configure em /settings."
+      "[webhook] CRITICAL: Kirvano sem token nem HMAC em producao. Configure kirvanoWebhookToken em /settings ou KIRVANO_WEBHOOK_HMAC_SECRET no env."
     );
     res.status(503).json({ error: "webhook_not_configured" });
     return;
