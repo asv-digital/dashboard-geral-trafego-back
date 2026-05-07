@@ -324,6 +324,23 @@ router.post("/kirvano", async (req: Request, res: Response) => {
       return;
     }
 
+    // C5 — match com CheckoutPrep capturado pre-redirect pelo front da landing.
+    // Procura o prep mais recente do mesmo produto+email com TTL ativo.
+    // Se achar, enriquece o Sale com fbc/fbp/IP/UA/landingUrl pra CAPI ter
+    // match quality alto. Sem prep, o Sale fica com fields null (graceful
+    // degradation) e CAPI dispara so com email/phone hashed.
+    let prep: Awaited<ReturnType<typeof prisma.checkoutPrep.findFirst>> = null;
+    if (customerEmail) {
+      prep = await prisma.checkoutPrep.findFirst({
+        where: {
+          productId: product.id,
+          email: customerEmail.toLowerCase(),
+          expiresAt: { gt: new Date() },
+        },
+        orderBy: { createdAt: "desc" },
+      });
+    }
+
     const sale = await prisma.sale.create({
       data: {
         productId: product.id,
@@ -347,7 +364,20 @@ router.post("/kirvano", async (req: Request, res: Response) => {
         customerLastName: lastName,
         kirvanoTxId: txId,
         kirvanoCheckoutId: pickString(payload.checkout_id, payload.kirvano_checkout_id),
+        fbc: prep?.fbc ?? null,
+        fbp: prep?.fbp ?? null,
+        clientIp: prep?.clientIp ?? null,
+        clientUserAgent: prep?.clientUserAgent ?? null,
+        eventSourceUrl: prep?.landingUrl ?? product.landingUrl ?? null,
+        // externalId estavel = sale.id apos create. Por enquanto deixa null
+        // e atualizamos abaixo (precisa do id Prisma gerado).
       },
+    });
+
+    // externalId = sale.id (estavel, unico, no nosso controle).
+    await prisma.sale.update({
+      where: { id: sale.id },
+      data: { externalId: sale.id },
     });
 
     await logAction({
@@ -373,11 +403,17 @@ router.post("/kirvano", async (req: Request, res: Response) => {
           value: amountGross,
           currency: "BRL",
           contentName: product.name,
+          eventSourceUrl: prep?.landingUrl ?? product.landingUrl ?? undefined,
           user: {
             email: customerEmail,
             phone: customerPhone,
             firstName,
             lastName,
+            externalId: sale.id,
+            fbc: prep?.fbc ?? undefined,
+            fbp: prep?.fbp ?? undefined,
+            clientIpAddress: prep?.clientIp ?? undefined,
+            clientUserAgent: prep?.clientUserAgent ?? undefined,
           },
         });
         if (capiResult.ok) {

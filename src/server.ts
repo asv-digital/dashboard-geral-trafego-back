@@ -17,6 +17,7 @@ import productAssetsRoutes from "./routes/product-assets";
 import plannerRoutes from "./routes/planner";
 import placementsRoutes from "./routes/placements";
 import notificationsRoutes from "./routes/notifications";
+import checkoutPrepRoutes from "./routes/checkout-prep";
 import { deleteExpiredSessions } from "./auth/session";
 import { startScheduler } from "./agent/scheduler";
 import { startDailySummary } from "./services/daily-summary";
@@ -49,8 +50,10 @@ app.use(
 );
 app.use("/uploads", express.static(getLocalUploadsRoot()));
 
-// Webhooks antes do auth pra não exigir sessão
+// Webhooks e checkout-prep antes do auth pra não exigir sessão
+// (sao chamados por servidores externos / browser do user)
 app.use("/api/webhooks", webhookRoutes);
+app.use("/api/checkout-prep", checkoutPrepRoutes);
 
 // Rotas autenticadas + públicas
 app.use("/api/health", healthRoutes);

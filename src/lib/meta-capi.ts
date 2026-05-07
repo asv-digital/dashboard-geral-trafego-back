@@ -15,6 +15,14 @@ interface CapiUserData {
   phone?: string;
   firstName?: string;
   lastName?: string;
+  // C5 — enrichment fields. Sem fbc/fbp/IP/UA, match quality cai pra 4-5 e
+  // dedup com Pixel browser falha. Esses fields vem do CheckoutPrep capturado
+  // no front da landing antes do redirect pro gateway.
+  fbc?: string;             // _fbc cookie ("fb.1.<ts>.<fbclid>")
+  fbp?: string;             // _fbp cookie
+  clientIpAddress?: string; // IP do user (nao do webhook)
+  clientUserAgent?: string;
+  externalId?: string;      // ID estavel do customer no nosso sistema
 }
 
 interface CapiEventInput {
@@ -26,6 +34,9 @@ interface CapiEventInput {
   currency?: string;
   contentName?: string;
   user: CapiUserData;
+  // URL onde o evento ocorreu (top-level field do CAPI). Top of funnel:
+  // landing URL. Bottom: checkout URL. Meta usa pra ranking de qualidade.
+  eventSourceUrl?: string;
 }
 
 export async function sendCapiEvent(input: CapiEventInput): Promise<{ ok: boolean; error?: string }> {
@@ -34,28 +45,35 @@ export async function sendCapiEvent(input: CapiEventInput): Promise<{ ok: boolea
   if (!token) return { ok: false, error: "no_token" };
   if (!input.pixelId) return { ok: false, error: "no_pixel" };
 
+  // user_data: Meta espera valores hashed (em/ph/fn/ln/external_id) e raw
+  // (client_ip_address/client_user_agent/fbc/fbp). Documentado em
+  // developers.facebook.com/docs/marketing-api/conversions-api/parameters
   const userData: Record<string, string> = {};
   if (input.user.email) userData.em = sha256Lower(input.user.email);
   if (input.user.phone) userData.ph = sha256Lower(input.user.phone.replace(/\D/g, ""));
   if (input.user.firstName) userData.fn = sha256Lower(input.user.firstName);
   if (input.user.lastName) userData.ln = sha256Lower(input.user.lastName);
+  if (input.user.externalId) userData.external_id = sha256Lower(input.user.externalId);
+  if (input.user.clientIpAddress) userData.client_ip_address = input.user.clientIpAddress;
+  if (input.user.clientUserAgent) userData.client_user_agent = input.user.clientUserAgent;
+  if (input.user.fbc) userData.fbc = input.user.fbc;
+  if (input.user.fbp) userData.fbp = input.user.fbp;
 
-  const payload = {
-    data: [
-      {
-        event_name: input.eventName,
-        event_time: Math.floor(input.eventTime.getTime() / 1000),
-        event_id: input.eventId,
-        action_source: "website",
-        user_data: userData,
-        custom_data: {
-          currency: input.currency || "BRL",
-          value: input.value,
-          content_name: input.contentName,
-        },
-      },
-    ],
+  const eventData: Record<string, unknown> = {
+    event_name: input.eventName,
+    event_time: Math.floor(input.eventTime.getTime() / 1000),
+    event_id: input.eventId,
+    action_source: "website",
+    user_data: userData,
+    custom_data: {
+      currency: input.currency || "BRL",
+      value: input.value,
+      content_name: input.contentName,
+    },
   };
+  if (input.eventSourceUrl) eventData.event_source_url = input.eventSourceUrl;
+
+  const payload = { data: [eventData] };
 
   try {
     const res = await fetch(`${META_BASE}/${input.pixelId}/events?access_token=${token}`, {

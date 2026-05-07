@@ -116,6 +116,7 @@ model Product {
   creatives           Creative[]
   assets              ProductAsset[]
   cartAbandonments    CartAbandonment[]
+  checkoutPreps       CheckoutPrep[]
   dailySnapshots      DailySnapshot[]
   placementMetrics    PlacementMetric[]
   actionLogs          ActionLog[]
@@ -362,6 +363,16 @@ model Sale {
   capiSentAt  DateTime?
   capiEventId String?
 
+  // C5 — CAPI enrichment fields. Aumenta match quality (4-5 → 7-9) quando
+  // populados via CheckoutPrep antes do redirect. Sem eles, CAPI dispara
+  // com matching fraco (so email+phone hash) e dedup com Pixel browser falha.
+  fbc             String? // _fbc cookie ("fb.1.<ts>.<fbclid>")
+  fbp             String? // _fbp cookie ("fb.1.<ts>.<random>")
+  clientIp        String? // IP do user (do checkout-prep, nao do webhook)
+  clientUserAgent String? // user agent do browser do user
+  eventSourceUrl  String? // URL onde o checkout iniciou (landing/checkout page)
+  externalId      String? // ID estavel do customer no nosso sistema
+
   convertedToMentoria Boolean   @default(false)
   mentoriaConvertedAt DateTime?
 
@@ -372,6 +383,35 @@ model Sale {
   campaign Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
 
   @@index([productId, date, status])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CHECKOUT PREP — captura fbc/fbp/IP/UA antes do redirect pro gateway.
+// Front da landing chama POST /api/checkout-prep antes de redirecionar pro
+// Kirvano. Quando o webhook chega, fazemos match (productId + email) e
+// enriquecemos o Sale + CAPI. Aumenta match quality CAPI de 4-5 pra 7-9.
+// Expira em 1h (compras finalizam dentro desse prazo).
+// ═══════════════════════════════════════════════════════════════
+
+model CheckoutPrep {
+  id              String   @id @default(cuid())
+  productId       String
+  sessionId       String   // UUID gerado no front
+  email           String?
+  phone           String?
+  fbc             String?
+  fbp             String?
+  clientIp        String?
+  clientUserAgent String?
+  landingUrl      String?
+  expiresAt       DateTime
+  createdAt       DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId, email, expiresAt])
+  @@index([sessionId])
+  @@index([expiresAt])
 }
 
 // ═══════════════════════════════════════════════════════════════
