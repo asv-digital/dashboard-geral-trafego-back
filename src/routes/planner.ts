@@ -16,12 +16,18 @@ router.post(
   requireRole("owner", "editor"),
   async (req: Request, res: Response) => {
     const result = await planCampaignsForProduct(String(req.params.productId), false);
+    // Estados:
+    //   ok=true  → sucesso total → 200 + result
+    //   ok=false sem nada criado → falha total → 400 + result
+    //   ok=false com algo criado → partial → 200 + { ...result, partial: true }
+    // (M9: trocado 207 Multi-Status por 200+partial flag — frontends genericos
+    //  presumem 2xx=ok e 4xx=fail; 207 caia silenciosamente em sucesso.)
     if (!result.ok && (!result.created || result.created.length === 0)) {
       res.status(400).json(result);
       return;
     }
     if (!result.ok) {
-      res.status(207).json(result);
+      res.json({ ...result, partial: true });
       return;
     }
     res.json(result);

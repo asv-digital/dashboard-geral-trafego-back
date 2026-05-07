@@ -275,7 +275,10 @@ async function getAdsetSnapshot(productId: string): Promise<AdsetSnapshot[]> {
       dailyBudget: a.dailyBudget,
       isInLearningPhase: dbCamp.isInLearningPhase,
       inPostLearningGrace,
+      // M2 — flag persistida pelo planner; fallback heuristico por nome
+      // pra campanhas legadas que nao tinham isASC marcado.
       isASC:
+        dbCamp.isASC ||
         dbCamp.name.toUpperCase().includes("ASC") ||
         dbCamp.name.toUpperCase().includes("ADVANTAGE"),
       totalSpend,

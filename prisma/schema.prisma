@@ -223,6 +223,9 @@ model Campaign {
 
   name              String
   type              String // Prospecção | Remarketing | ASC
+  // M2 — flag persistida (substitui detecção heurística por nome no auto-executor).
+  // True quando a campanha foi criada como ASC (Advantage+ Shopping Campaign).
+  isASC             Boolean @default(false)
   audience          String?
   dailyBudget       Float
   startDate         DateTime

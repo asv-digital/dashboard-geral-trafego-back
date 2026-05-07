@@ -5,6 +5,7 @@
 import prisma from "../prisma";
 import { addBRTDays, nextHourBRT, startOfBRTDay } from "../lib/tz";
 import { sendNotification } from "./whatsapp-notifier";
+import { runSystemHealthChecks } from "./system-alerts";
 
 const SUMMARY_HOUR_BRT = 8;
 
@@ -162,6 +163,9 @@ async function buildProductSummary(productId: string): Promise<ProductSummary> {
 }
 
 async function sendDailySummaries(): Promise<void> {
+  // System-wide health checks (token expiry, etc) antes do summary por produto.
+  await runSystemHealthChecks();
+
   const products = await prisma.product.findMany({
     where: { status: "active" },
     select: { id: true },

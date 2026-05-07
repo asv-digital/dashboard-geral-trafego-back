@@ -329,14 +329,37 @@ export async function planCampaignsForProduct(
       .toISOString()
       .slice(0, 10)}`;
     try {
-      // 1. Campaign
+      // 1. Campaign — ASC nativo quando playbook marca usesAdvantage.
+      // Sem smart_promotion_type, "ASC" era so OUTCOME_SALES com placements
+      // automaticos (heuristica frouxa). Agora Meta cria campanha gerida por
+      // IA (audiencia + criativo + placement automatizados).
       const camp = await createCampaign({
         adAccountId,
         name: fullName,
         objective: "OUTCOME_SALES",
         status: "PAUSED",
+        smartPromotionType: plan.usesAdvantage ? "AUTOMATED_SHOPPING_ADS" : undefined,
       });
       metaCampaignId = camp.id;
+
+      // M3 — exclusion automatica de buyers em prospeccao/remarketing
+      // (ASC ja gerencia "existing customer cap" sozinho). Sem isso, o
+      // agente paga pra reentregar pra quem ja comprou.
+      const buyersAudienceId = metaConfig.audienceBuyersId;
+      const existingExclusions =
+        ((plan.targeting as Record<string, unknown>).excluded_custom_audiences as
+          | Array<{ id: string }>
+          | undefined) || [];
+      const targetingWithExclusion =
+        buyersAudienceId && !plan.usesAdvantage
+          ? {
+              ...plan.targeting,
+              excluded_custom_audiences: [
+                ...existingExclusions.filter(e => e.id !== buyersAudienceId),
+                { id: buyersAudienceId },
+              ],
+            }
+          : plan.targeting;
 
       // 2. AdSet
       const adset = await createAdset({
@@ -344,7 +367,7 @@ export async function planCampaignsForProduct(
         campaignId: camp.id,
         name: `${plan.name} — adset`,
         dailyBudgetReais: plan.dailyBudget,
-        targeting: plan.targeting,
+        targeting: targetingWithExclusion,
         optimizationGoal: plan.optimizationGoal,
         pixelId,
         customEventType: "PURCHASE",
@@ -438,6 +461,7 @@ export async function planCampaignsForProduct(
           productId,
           name: fullName,
           type: plan.type,
+          isASC: !!plan.usesAdvantage,
           audience: plan.audience,
           dailyBudget: plan.dailyBudget,
           startDate: new Date(),

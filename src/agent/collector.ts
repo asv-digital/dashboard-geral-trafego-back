@@ -702,11 +702,37 @@ export async function collectProduct(productId: string): Promise<ProductCollecti
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[collector:${product.slug}] erro: ${msg}`);
 
-    await prisma.agentHeartbeat.upsert({
+    const updated = await prisma.agentHeartbeat.upsert({
       where: { productId },
       create: { productId, consecutiveFailures: 1, lastError: msg },
       update: { consecutiveFailures: { increment: 1 }, lastError: msg },
     });
+
+    // D7 — alerta automatico apos 3 falhas consecutivas. Edge-triggered via
+    // alert-dedup pra nao floodar (so dispara quando passa de 2→3 e ai cada
+    // 24h enquanto continuar travado). Sem isso, o coletor podia parar de
+    // funcionar silenciosamente e ninguem perceber ate o gasto fugir.
+    if (updated.consecutiveFailures >= 3) {
+      const { sendNotification } = await import("../services/whatsapp-notifier");
+      const { shouldSendStateAlert } = await import("../lib/alert-dedup");
+      const should = await shouldSendStateAlert(
+        productId,
+        "collector_failing",
+        `failures:${updated.consecutiveFailures >= 5 ? "5+" : updated.consecutiveFailures}`,
+        24 * 60 * 60 * 1000
+      );
+      if (should) {
+        await sendNotification(
+          "alert_critical",
+          {
+            type: "COLETOR FALHANDO",
+            detail: `${product.name}: ${updated.consecutiveFailures} falhas consecutivas. Ultimo erro: ${msg.slice(0, 200)}`,
+            action: "Verificar Meta token / ad account / rede do servidor",
+          },
+          productId
+        );
+      }
+    }
 
     return {
       productId,

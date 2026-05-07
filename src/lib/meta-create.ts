@@ -32,16 +32,25 @@ export interface CreateCampaignInput {
   objective: "OUTCOME_SALES" | "OUTCOME_TRAFFIC" | "OUTCOME_ENGAGEMENT";
   buyingType?: "AUCTION";
   status?: "ACTIVE" | "PAUSED";
+  // M2 — flag pra ASC nativo (Advantage+ Shopping Campaigns). Quando setado,
+  // Meta criar campanha gerenciada por IA (audiencia/placements/criativos
+  // automatizados). Sem isso, mesmo nomeando "ASC" e setando publisher_platforms
+  // = vazio, e so OUTCOME_SALES manual com placements automaticos.
+  smartPromotionType?: "AUTOMATED_SHOPPING_ADS";
 }
 
 export async function createCampaign(input: CreateCampaignInput): Promise<{ id: string }> {
-  return post(`${input.adAccountId}/campaigns`, {
+  const params: Record<string, any> = {
     name: input.name,
     objective: input.objective,
     buying_type: input.buyingType || "AUCTION",
     special_ad_categories: [],
     status: input.status || "PAUSED",
-  });
+  };
+  if (input.smartPromotionType) {
+    params.smart_promotion_type = input.smartPromotionType;
+  }
+  return post(`${input.adAccountId}/campaigns`, params);
 }
 
 export interface CreateAdsetInput {

@@ -57,6 +57,21 @@ export function clearRuntimeConfigCache(
   }
 }
 
+/**
+ * D8 — Meta exige ad account no formato "act_<numero>". O usuario as vezes
+ * salva so o numero ou copia com espaco extra. Normaliza pra evitar 400 do
+ * Meta. Se vier vazio retorna vazio (env-check decide se e fatal).
+ */
+function normalizeAdAccountId(value: string): string {
+  const v = (value || "").trim();
+  if (!v) return "";
+  if (v.startsWith("act_")) return v;
+  if (/^\d+$/.test(v)) return `act_${v}`;
+  // Formato estranho (e.g. "Account 123") — devolve cru pra usuario ver erro
+  // do Meta e corrigir, em vez de mascarar com normalizacao agressiva.
+  return v;
+}
+
 export async function getResolvedGlobalSettings(
   forceRefresh = false
 ): Promise<ResolvedGlobalSettings> {
@@ -74,7 +89,9 @@ export async function getResolvedGlobalSettings(
       settings?.metaTokenCreatedAt?.toISOString() ||
       clean(process.env.META_TOKEN_CREATED_AT) ||
       null,
-    metaAdAccountId: clean(settings?.metaAdAccountId) || clean(process.env.META_AD_ACCOUNT_ID),
+    metaAdAccountId: normalizeAdAccountId(
+      clean(settings?.metaAdAccountId) || clean(process.env.META_AD_ACCOUNT_ID)
+    ),
     metaAppId: clean(settings?.metaAppId) || clean(process.env.META_APP_ID),
     metaAppSecret: clean(settings?.metaAppSecret) || clean(process.env.META_APP_SECRET),
     metaPixelId: clean(settings?.metaPixelId) || clean(process.env.META_PIXEL_ID),
