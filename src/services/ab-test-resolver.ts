@@ -172,6 +172,17 @@ export function pickWinner(
 }
 
 export async function resolveActiveTestsForProduct(productId: string): Promise<void> {
+  // D6 — supervisedMode: ab-test-resolver pausa ad loser via Meta API,
+  // que e mutation. Em modo supervised o agente so coleta+sugere; nao mexe.
+  const product = await prisma.product.findUnique({
+    where: { id: productId },
+    select: { supervisedMode: true, slug: true },
+  });
+  if (product?.supervisedMode) {
+    console.log(`[ab-resolver:${product.slug}] supervisedMode ON, pulando`);
+    return;
+  }
+
   const tests = await prisma.creativeTest.findMany({
     where: {
       productId,

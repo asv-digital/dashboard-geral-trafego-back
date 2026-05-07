@@ -395,10 +395,15 @@ router.post("/kirvano", async (req: Request, res: Response) => {
       const productMeta = await getResolvedProductMetaSettings(product);
       const pixelId = productMeta.pixelId;
       if (pixelId) {
+        // D5 — event_id = kirvanoTxId (transaction id). Bate com o Pixel
+        // que o Kirvano dispara browser-side na thank-you-page com mesmo id.
+        // Meta dedup CAPI x Pixel quando event_id+event_name+event_time
+        // batem dentro de minutos. Antes usavamos sale.id (cuid Prisma) que
+        // nunca bateria com o Pixel — dedup falhava silenciosamente.
         const capiResult = await sendCapiEvent({
           pixelId,
           eventName: "Purchase",
-          eventId: sale.id,
+          eventId: txId,
           eventTime: saleDate,
           value: amountGross,
           currency: "BRL",
@@ -422,11 +427,22 @@ router.post("/kirvano", async (req: Request, res: Response) => {
             data: {
               capiSent: true,
               capiSentAt: new Date(),
-              capiEventId: sale.id,
+              capiEventId: txId,
+              capiResponse: {
+                eventsReceived: capiResult.eventsReceived ?? null,
+                fbtraceId: capiResult.fbtraceId ?? null,
+                diagnostics: (capiResult.diagnostics as unknown[]) ?? null,
+              } as object,
             },
           });
         } else {
           console.error(`[webhook] CAPI falhou: ${capiResult.error}`);
+          await prisma.sale.update({
+            where: { id: sale.id },
+            data: {
+              capiResponse: { error: capiResult.error } as object,
+            },
+          });
         }
       }
 

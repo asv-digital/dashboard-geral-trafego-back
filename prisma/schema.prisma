@@ -369,6 +369,9 @@ model Sale {
   capiSent    Boolean  @default(false)
   capiSentAt  DateTime?
   capiEventId String?
+  // D1 — observability: { eventsReceived, fbtraceId, diagnostics } | { error }.
+  // Permite detectar drop silencioso (events_received=0 com http 200).
+  capiResponse Json?
 
   // C5 — CAPI enrichment fields. Aumenta match quality (4-5 → 7-9) quando
   // populados via CheckoutPrep antes do redirect. Sem eles, CAPI dispara

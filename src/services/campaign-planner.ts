@@ -19,6 +19,7 @@ import {
   createAdCreative,
   createAd,
 } from "../lib/meta-create";
+import { appendDynamicUtms } from "../lib/url-utm";
 import {
   activateCampaign,
   activateAdset,
@@ -412,7 +413,9 @@ export async function planCampaignsForProduct(
           adAccountId,
           name: creativeName,
           pageId,
-          linkUrl: product.landingUrl,
+          // D4 — UTM dinamico via placeholders Meta. Garante atribuicao
+          // perfeita no webhook (utm_content={{ad.id}} = metaAdId).
+          linkUrl: appendDynamicUtms(product.landingUrl),
           headline,
           primaryText,
           description,
@@ -443,8 +446,10 @@ export async function planCampaignsForProduct(
       }
 
       // 4. Auto-activate se o produto pediu
+      // D6 — supervisedMode forca PAUSED mesmo se autoActivate=true.
+      // O agente cria a estrutura mas nao liga; user revisa e ativa.
       let finalStatus: "Ativa" | "Pausada" = "Pausada";
-      if (product.autoActivate) {
+      if (product.autoActivate && !product.supervisedMode) {
         const adsetActivated = await activateAdset(adset.id);
         const campaignActivated = await activateCampaign(camp.id);
         if (adsetActivated && campaignActivated) {

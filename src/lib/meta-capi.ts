@@ -1,5 +1,8 @@
 // Conversions API (CAPI) — envia Purchase events pro Meta.
-// Event ID = sale.id pra deduplicar com pixel do browser.
+// Event ID = kirvanoTxId (D5): Kirvano dispara Pixel browser-side na thank-you-page
+// com o transaction_id, e Meta dedup CAPI x Pixel quando event_id bate. Antes
+// usavamos sale.id (cuid Prisma) que nunca bateria com nada do Pixel — dedup falhava
+// e Meta podia duplicar atribuicao de Purchase.
 
 import crypto from "crypto";
 import { getResolvedGlobalSettings } from "./runtime-config";
@@ -39,7 +42,25 @@ interface CapiEventInput {
   eventSourceUrl?: string;
 }
 
-export async function sendCapiEvent(input: CapiEventInput): Promise<{ ok: boolean; error?: string }> {
+export interface CapiResult {
+  ok: boolean;
+  error?: string;
+  // D1 — observability: o Meta retorna events_received, fbtrace_id e
+  // diagnostics. Capturamos pra logar match quality real e detectar
+  // events_dropped (se receivedCount < enviado, algo zoou).
+  eventsReceived?: number;
+  fbtraceId?: string;
+  diagnostics?: unknown;
+}
+
+interface CapiResponseBody {
+  events_received?: number;
+  messages?: string[];
+  fbtrace_id?: string;
+  // Eventos rejeitados aparecem como `events_received: 0` ou em messages[].
+}
+
+export async function sendCapiEvent(input: CapiEventInput): Promise<CapiResult> {
   const { metaAccessToken } = await getResolvedGlobalSettings();
   const token = metaAccessToken;
   if (!token) return { ok: false, error: "no_token" };
@@ -59,9 +80,16 @@ export async function sendCapiEvent(input: CapiEventInput): Promise<{ ok: boolea
   if (input.user.fbc) userData.fbc = input.user.fbc;
   if (input.user.fbp) userData.fbp = input.user.fbp;
 
+  // event_time clamp: Meta rejeita eventos com timestamp > 7d no passado ou
+  // > 1h no futuro. Sale antiga reprocessada cairia. Forca pra 7d se passou.
+  const eventTimeUnix = Math.floor(input.eventTime.getTime() / 1000);
+  const nowUnix = Math.floor(Date.now() / 1000);
+  const minUnix = nowUnix - 7 * 24 * 60 * 60 + 60; // 60s buffer
+  const safeEventTime = Math.max(eventTimeUnix, minUnix);
+
   const eventData: Record<string, unknown> = {
     event_name: input.eventName,
-    event_time: Math.floor(input.eventTime.getTime() / 1000),
+    event_time: safeEventTime,
     event_id: input.eventId,
     action_source: "website",
     user_data: userData,
@@ -81,11 +109,28 @@ export async function sendCapiEvent(input: CapiEventInput): Promise<{ ok: boolea
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    const bodyText = await res.text();
     if (!res.ok) {
-      const err = await res.text();
-      return { ok: false, error: `capi http ${res.status}: ${err}` };
+      return { ok: false, error: `capi http ${res.status}: ${bodyText}` };
     }
-    return { ok: true };
+    let body: CapiResponseBody = {};
+    try {
+      body = JSON.parse(bodyText) as CapiResponseBody;
+    } catch {
+      // resposta nao e JSON valido — incomum mas nao quebra
+    }
+    const eventsReceived = body.events_received ?? 0;
+    if (eventsReceived === 0) {
+      console.warn(
+        `[capi] events_received=0 (drop silencioso). pixel=${input.pixelId} event=${input.eventName} id=${input.eventId} fbtrace=${body.fbtrace_id ?? "?"} messages=${JSON.stringify(body.messages ?? [])}`
+      );
+    }
+    return {
+      ok: true,
+      eventsReceived,
+      fbtraceId: body.fbtrace_id,
+      diagnostics: body.messages,
+    };
   } catch (err) {
     return { ok: false, error: (err as Error).message };
   }

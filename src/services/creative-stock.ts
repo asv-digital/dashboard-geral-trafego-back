@@ -96,6 +96,11 @@ export async function checkCreativeStockForProduct(productId: string): Promise<v
     include: { automationConfig: true },
   });
   if (!product || !product.automationConfig) return;
+  // D6 — supervisedMode bloqueia mutations Meta (pauseAd em criativos exaustos).
+  if (product.supervisedMode) {
+    console.log(`[creative-stock:${product.slug}] supervisedMode ON, pulando rotacao`);
+    return;
+  }
 
   const creatives = await prisma.creative.findMany({
     where: { productId, status: { not: "exhausted" } },

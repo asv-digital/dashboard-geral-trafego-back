@@ -61,6 +61,12 @@ async function createLookalikeAudience(
 export async function checkLookalikeForProduct(productId: string): Promise<void> {
   const product = await prisma.product.findUnique({ where: { id: productId } });
   if (!product) return;
+  // D6 — supervisedMode: criar LAL e mutation no Meta. Em modo supervised
+  // a gente nao toca. User cria audience manualmente.
+  if (product.supervisedMode) {
+    console.log(`[audience-builder:${product.slug}] supervisedMode ON, pulando`);
+    return;
+  }
 
   const metaConfig = await getResolvedProductMetaSettings(product);
   const adAccountId = metaConfig.adAccountId;
