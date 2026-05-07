@@ -50,6 +50,19 @@ app.use(
 );
 app.use("/uploads", express.static(getLocalUploadsRoot()));
 
+// Snippets publicos (servidos sem auth) — usado pelas landings externas.
+// Cache curto (5min) pra mudancas chegarem rapido sem martelar o backend.
+app.use(
+  "/public",
+  express.static(require("path").join(__dirname, "static"), {
+    maxAge: 5 * 60 * 1000,
+    setHeaders: res => {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+    },
+  })
+);
+
 // Webhooks e checkout-prep antes do auth pra não exigir sessão
 // (sao chamados por servidores externos / browser do user)
 app.use("/api/webhooks", webhookRoutes);
