@@ -20,12 +20,18 @@ router.get("/", async (req: Request, res: Response) => {
   res.json({ creatives });
 });
 
+const awarenessSchema = z
+  .enum(["unaware", "problem", "solution", "product", "most_aware"])
+  .nullable()
+  .optional();
+
 const createSchema = z.object({
   productId: z.string(),
   campaignId: z.string().optional(),
   name: z.string(),
   type: z.string(),
   status: z.string().default("active"),
+  awarenessStage: awarenessSchema,
 });
 
 const updateSchema = z.object({
@@ -37,6 +43,7 @@ const updateSchema = z.object({
   hookRate: z.number().nullable().optional(),
   cpa: z.number().nullable().optional(),
   thruplayRate: z.number().nullable().optional(),
+  awarenessStage: awarenessSchema,
 });
 
 router.post("/", requireRole("owner", "editor"), async (req: Request, res: Response) => {

@@ -140,6 +140,12 @@ model ProductAsset {
   id             String   @id @default(cuid())
   productId      String
   type           String   // image | video | copy | headline | hook
+  // Stages of Awareness (Eugene Schwartz, Breakthrough Advertising 1966):
+  // unaware → problem → solution → product → most_aware. Define se a copy
+  // bate com o nivel de consciencia do publico — usar copy product-aware
+  // num cold (unaware/problem) explode CPA. Tagging permite cruzar com
+  // CPA por audience type e identificar incompatibilidade.
+  awarenessStage String?  // unaware | problem | solution | product | most_aware
   name           String
   originalUrl    String?  // URL R2 (pra mídia)
   r2Key          String?  // chave no bucket R2 (pra mídia)
@@ -315,6 +321,8 @@ model Creative {
   // por nome). Match heuristico-por-nome continua como fallback pra criativos
   // sem metaAdId ainda, mas decisoes posteriores reusam o ID estavel.
   metaAdId     String?
+  // Stages of Awareness (Schwartz). Replicado do asset principal pra speed.
+  awarenessStage String?  // unaware | problem | solution | product | most_aware
   type         String // video | image | carousel
   status       String @default("active") // active | paused | exhausted
   ctr          Float?

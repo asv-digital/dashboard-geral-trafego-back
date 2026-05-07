@@ -42,6 +42,11 @@ router.post(
   const type = String(req.body.type || "");
   const name = String(req.body.name || "");
   const tags = req.body.tags ? String(req.body.tags) : undefined;
+  // Stages of Awareness (Schwartz). Opcional, validacao explicita.
+  const VALID_STAGES = ["unaware", "problem", "solution", "product", "most_aware"];
+  const awarenessRaw = req.body.awarenessStage ? String(req.body.awarenessStage) : null;
+  const awarenessStage =
+    awarenessRaw && VALID_STAGES.includes(awarenessRaw) ? awarenessRaw : null;
 
   if (!productId || !type || !name) {
     res.status(400).json({ error: "missing fields" });
@@ -67,6 +72,7 @@ router.post(
         type,
         name,
         tags,
+        awarenessStage,
         status: "ready",
         originalUrl: null,
         content: text.slice(0, 10000),
@@ -114,6 +120,7 @@ router.post(
         type,
         name,
         tags,
+        awarenessStage,
         status: "uploaded",
         originalUrl: uploaded.url,
         r2Key: uploaded.key,
@@ -144,6 +151,32 @@ router.post(
   }
   }
 );
+
+// PATCH /:id — edita campos do asset (awarenessStage por enquanto).
+const patchSchema = z.object({
+  awarenessStage: z
+    .enum(["unaware", "problem", "solution", "product", "most_aware"])
+    .nullable()
+    .optional(),
+  name: z.string().min(1).optional(),
+  tags: z.string().nullable().optional(),
+});
+router.patch("/:id", requireRole("owner", "editor"), async (req: Request, res: Response) => {
+  const parsed = patchSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "invalid_input", details: parsed.error.issues });
+    return;
+  }
+  try {
+    const asset = await prisma.productAsset.update({
+      where: { id: String(req.params.id) },
+      data: parsed.data,
+    });
+    res.json({ asset });
+  } catch {
+    res.status(404).json({ error: "not_found" });
+  }
+});
 
 router.delete("/:id", requireRole("owner", "editor"), async (req: Request, res: Response) => {
   try {
