@@ -16,6 +16,38 @@ import { addBRTDays, startOfBRTDay } from "../lib/tz";
 
 const META_BASE = `https://graph.facebook.com/${process.env.META_GRAPH_VERSION || "v19.0"}`;
 
+// M7 — throttle Graph: comment-analyzer roda paginacao infinita por ad
+// (20+ ads x 200+ comentarios cada = 80+ requests). MetaClient ja throttla
+// a ~200ms entre requests, mas usa instancia compartilhada apenas pra
+// insights. Aqui replicamos o padrao com closure de modulo + retry
+// exponencial pra 429/5xx — sem acoplamento com a classe MetaClient.
+const MIN_GRAPH_INTERVAL_MS = 200;
+const RETRYABLE_STATUSES = new Set([429, 502, 503, 504]);
+let lastGraphFetchAt = 0;
+
+async function throttledGraphFetch(url: string): Promise<Response> {
+  const now = Date.now();
+  const elapsed = now - lastGraphFetchAt;
+  if (elapsed < MIN_GRAPH_INTERVAL_MS) {
+    await new Promise(r => setTimeout(r, MIN_GRAPH_INTERVAL_MS - elapsed));
+  }
+  lastGraphFetchAt = Date.now();
+
+  let attempt = 0;
+  const maxAttempts = 3;
+  while (true) {
+    const res = await fetch(url);
+    if (!RETRYABLE_STATUSES.has(res.status) || attempt >= maxAttempts) return res;
+    attempt++;
+    const backoffMs = Math.pow(2, attempt) * 1000;
+    console.warn(
+      `[comment-analyzer] graph ${res.status} retry ${attempt}/${maxAttempts} after ${backoffMs}ms`
+    );
+    await new Promise(r => setTimeout(r, backoffMs));
+    lastGraphFetchAt = Date.now();
+  }
+}
+
 type Sentiment =
   | "positive"
   | "negative"
@@ -44,7 +76,7 @@ async function fetchAdComments(adId: string): Promise<RawComment[]> {
       `&access_token=${token}`;
 
     while (url) {
-      const res = await fetch(url);
+      const res = await throttledGraphFetch(url);
       if (!res.ok) return comments;
       const json = (await res.json()) as {
         data?: RawComment[];

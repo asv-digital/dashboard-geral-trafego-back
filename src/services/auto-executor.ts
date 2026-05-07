@@ -359,7 +359,11 @@ export async function executeAutomationsForProduct(productId: string): Promise<v
     return;
   }
 
-  // R1 — teto diário do produto
+  // R1 — teto diário do produto. M8: pause ratcheted em vez de mass-pause
+  // direto. Se o gasto excede o teto em <10%, pausa apenas top 50% adsets
+  // por gasto (os mais caros). Acima de 10%, pausa todos. Evita derrubar
+  // produto inteiro por um pequeno overshoot causado por delay de coleta
+  // ou ajuste de target errado pelo usuario.
   const todayStart = startOfBRTDay();
   const todayAgg = await prisma.metricEntry.aggregate({
     where: { productId, date: { gte: todayStart } },
@@ -367,27 +371,45 @@ export async function executeAutomationsForProduct(productId: string): Promise<v
   });
   const todaySpend = todayAgg._sum.investment || 0;
   if (todaySpend >= product.dailyBudgetTarget) {
-    console.log(
-      `[auto:${product.slug}] teto diário atingido: R$${todaySpend.toFixed(0)} >= R$${product.dailyBudgetTarget}`
+    const overshootPct =
+      ((todaySpend - product.dailyBudgetTarget) / product.dailyBudgetTarget) * 100;
+    const isSoftBreach = overshootPct < 10;
+
+    // Adsets ordenados por gasto desc (mais caros primeiro)
+    const sortedByCost = [...snapshots].sort(
+      (a, b) =>
+        b.daily.reduce((s, d) => s + d.spend, 0) - a.daily.reduce((s, d) => s + d.spend, 0)
     );
+    const targetPauseCount = isSoftBreach
+      ? Math.max(1, Math.ceil(sortedByCost.length / 2))
+      : sortedByCost.length;
+    const adsetsToPause = sortedByCost.slice(0, targetPauseCount);
+
+    console.log(
+      `[auto:${product.slug}] teto atingido (${overshootPct.toFixed(0)}% overshoot): ${isSoftBreach ? "soft" : "hard"} — pausando ${adsetsToPause.length}/${sortedByCost.length}`
+    );
+
     let paused = 0;
-    for (const s of snapshots) {
+    for (const s of adsetsToPause) {
       if (await pauseAdset(s.adsetId)) paused++;
     }
     await logAction({
       productId,
-      action: "emergency_budget_pause",
+      action: isSoftBreach ? "soft_budget_pause" : "emergency_budget_pause",
       entityType: "product",
       entityId: productId,
       entityName: product.name,
-      details: `Gasto R$${todaySpend.toFixed(0)} >= teto R$${product.dailyBudgetTarget}. ${paused} adsets pausados.`,
+      details: `Gasto R$${todaySpend.toFixed(0)} ${isSoftBreach ? "soft-breach" : "HARD-breach"} de teto R$${product.dailyBudgetTarget} (+${overshootPct.toFixed(0)}%). ${paused}/${sortedByCost.length} adsets pausados (top por gasto).`,
+      reasoning: isSoftBreach
+        ? `Overshoot pequeno (${overshootPct.toFixed(0)}% > 0% mas < 10%). Pausando metade dos adsets, comecando pelos mais caros, em vez de derrubar produto inteiro. Se proximo ciclo ainda ultrapassar, escala pra hard pause.`
+        : `Overshoot grave (${overshootPct.toFixed(0)}% acima do teto). Pausando todos adsets pra estancar gasto.`,
     });
     await sendNotification(
       "alert_critical",
       {
-        type: "TETO DIÁRIO ATINGIDO",
-        detail: `${product.name}: R$${todaySpend.toFixed(0)} / R$${product.dailyBudgetTarget}`,
-        action: `${paused} adsets pausados`,
+        type: isSoftBreach ? "SOFT BUDGET BREACH" : "TETO DIÁRIO ESTOURADO",
+        detail: `${product.name}: R$${todaySpend.toFixed(0)} / R$${product.dailyBudgetTarget} (+${overshootPct.toFixed(0)}%)`,
+        action: `${paused}/${sortedByCost.length} adsets pausados`,
       },
       productId
     );
