@@ -17,6 +17,48 @@ interface VariantStats {
   cpa: number;
 }
 
+// M1 — significancia estatistica via Z-test 2-proporcoes (pooled variance)
+// substitui o heuristico antigo "confidence = diff * 5". Mais robusto pra
+// declarar winner em A/B com cuidado: nao pausa loser por sorte de poucos
+// dias. Min 20 conversoes por variante (regra classica adaptada pra BR
+// ticket alto — clientes web geralmente usam 30+).
+const MIN_CONVERSIONS_PER_VARIANT = 20;
+const Z_CONFIDENCE_THRESHOLD = 0.95; // 95% bicaudal
+
+/** CDF da normal padrao via aproximacao Hastings (erro < 7.5e-8). */
+function normCdf(z: number): number {
+  const t = 1 / (1 + 0.2316419 * Math.abs(z));
+  const d = 0.3989423 * Math.exp((-z * z) / 2);
+  let p =
+    d *
+    t *
+    (0.3193815 +
+      t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
+  return z > 0 ? 1 - p : p;
+}
+
+/**
+ * Z-test 2-proporcoes pooled. Retorna z + p-value bicaudal.
+ * k1/k2 = conversoes; n1/n2 = "trials" (proxy = spend em reais).
+ */
+function zTestTwoProp(
+  k1: number,
+  n1: number,
+  k2: number,
+  n2: number
+): { z: number; pValue: number } {
+  if (n1 <= 0 || n2 <= 0) return { z: 0, pValue: 1 };
+  const p1 = k1 / n1;
+  const p2 = k2 / n2;
+  const pPool = (k1 + k2) / (n1 + n2);
+  const se = Math.sqrt(pPool * (1 - pPool) * (1 / n1 + 1 / n2));
+  if (se === 0) return { z: 0, pValue: 1 };
+  const z = (p1 - p2) / se;
+  // bicaudal
+  const pValue = 2 * (1 - normCdf(Math.abs(z)));
+  return { z, pValue };
+}
+
 interface CreativeVariantRef {
   id?: unknown;
   name?: unknown;
@@ -89,30 +131,42 @@ export function pickWinner(
   a: VariantStats,
   b: VariantStats
 ): { winner: VariantStats; loser: VariantStats; confidence: number } | null {
-  if (a.sales >= 2 && b.sales === 0 && b.spend > 0) {
-    return {
-      winner: a,
-      loser: b,
-      confidence: Math.min(0.95, 0.8 + Math.min(0.15, b.spend / Math.max(a.spend, 1) / 10)),
-    };
+  // 1. Early winner por aniquilacao: um lado vende, outro queima sem vender.
+  // Mantido pra ad obviamente quebrado nao continuar gastando ate atingir
+  // MIN_CONVERSIONS no vencedor. Threshold subiu de 2 pra 5 vendas pra
+  // diminuir falso-positivo por sorte.
+  if (a.sales >= 5 && b.sales === 0 && b.spend > 0) {
+    // confidence proxy proporcional a quanto B gastou em relacao a A
+    const proxy = Math.min(0.95, 0.85 + Math.min(0.1, b.spend / Math.max(a.spend, 1) / 10));
+    return { winner: a, loser: b, confidence: proxy };
+  }
+  if (b.sales >= 5 && a.sales === 0 && a.spend > 0) {
+    const proxy = Math.min(0.95, 0.85 + Math.min(0.1, a.spend / Math.max(b.spend, 1) / 10));
+    return { winner: b, loser: a, confidence: proxy };
   }
 
-  if (b.sales >= 2 && a.sales === 0 && a.spend > 0) {
-    return {
-      winner: b,
-      loser: a,
-      confidence: Math.min(0.95, 0.8 + Math.min(0.15, a.spend / Math.max(b.spend, 1) / 10)),
-    };
+  // 2. Z-test 2-proporcoes. Exige amostra minima por variante.
+  if (a.sales < MIN_CONVERSIONS_PER_VARIANT || b.sales < MIN_CONVERSIONS_PER_VARIANT) {
+    return null;
   }
+  if (a.spend <= 0 || b.spend <= 0) return null;
 
-  if (a.sales < 2 || b.sales < 2) return null;
-  if (a.cpa === 0 || b.cpa === 0) return null;
+  // N (trials proxy) = spend em reais. Cada R$1 = 1 "trial".
+  // Limitação: ideal seria clicks/impressions, mas AdDiagnostic so tem spend.
+  // Quando houver coleta de clicks por adId no banco, trocar n1/n2 por
+  // a.clicks/b.clicks pro teste ser estatisticamente correto.
+  const n1 = Math.round(a.spend);
+  const n2 = Math.round(b.spend);
+  const { z, pValue } = zTestTwoProp(a.sales, n1, b.sales, n2);
+  const confidence = 1 - pValue;
+  if (confidence < Z_CONFIDENCE_THRESHOLD) return null;
 
-  const diff = Math.abs(a.cpa - b.cpa) / Math.max(a.cpa, b.cpa);
-  const confidence = Math.min(0.99, diff * 5);
-  if (confidence < 0.75 || diff < 0.15) return null;
+  // Winner = maior CR (sales/spend). CPA e o inverso, mas usamos CR pro test.
+  const crA = a.sales / n1;
+  const crB = b.sales / n2;
+  if (crA === crB) return null;
 
-  return a.cpa < b.cpa
+  return crA > crB
     ? { winner: a, loser: b, confidence }
     : { winner: b, loser: a, confidence };
 }

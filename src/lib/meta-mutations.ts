@@ -63,6 +63,69 @@ export async function updateCampaignBudget(metaCampaignId: string, budgetReais: 
   return metaPost(metaCampaignId, { daily_budget: Math.round(budgetReais * 100) });
 }
 
+// M10 — learning_stage_info: status oficial da Meta sobre learning phase
+// do adset. Possiveis valores: LEARNING, LEARNING_LIMITED, SUCCESS.
+// Usado pra decisao precisa em vez de inferir so por hora corrida.
+export type LearningStage = "LEARNING" | "LEARNING_LIMITED" | "SUCCESS" | "UNKNOWN";
+
+export interface AdsetLearningInfo {
+  adsetId: string;
+  status: LearningStage;
+  exitReason?: string;
+  conversions?: number;
+}
+
+/** Retorna learning_stage_info de varios adsets em batch. */
+export async function getAdsetsLearningInfo(
+  adsetIds: string[]
+): Promise<Map<string, AdsetLearningInfo>> {
+  const result = new Map<string, AdsetLearningInfo>();
+  if (adsetIds.length === 0) return result;
+
+  const { metaAccessToken } = await getResolvedGlobalSettings();
+  const t = metaAccessToken;
+  if (!t) return result;
+
+  // Graph batch: ate 50 IDs em uma request via ?ids=ID1,ID2,...
+  const CHUNK = 50;
+  for (let i = 0; i < adsetIds.length; i += CHUNK) {
+    const chunk = adsetIds.slice(i, i + CHUNK);
+    const url = new URL(`${META_BASE}/`);
+    url.searchParams.set("ids", chunk.join(","));
+    url.searchParams.set("fields", "learning_stage_info");
+    url.searchParams.set("access_token", t);
+
+    try {
+      const res = await fetch(url.toString());
+      if (!res.ok) continue;
+      const json = (await res.json()) as Record<
+        string,
+        { learning_stage_info?: { status?: string; exit_reason?: string; conversions?: number } }
+      >;
+      for (const [adsetId, info] of Object.entries(json)) {
+        const lsi = info.learning_stage_info;
+        const raw = (lsi?.status || "UNKNOWN").toUpperCase();
+        const status: LearningStage =
+          raw === "LEARNING" || raw === "LEARNING_LIMITED" || raw === "SUCCESS"
+            ? raw
+            : "UNKNOWN";
+        result.set(adsetId, {
+          adsetId,
+          status,
+          exitReason: lsi?.exit_reason,
+          conversions: lsi?.conversions,
+        });
+      }
+    } catch (err) {
+      console.error(
+        `[meta-mutations] getAdsetsLearningInfo chunk ${i} falhou: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  return result;
+}
+
 export async function getActiveAdsetsForCampaigns(
   accountId: string,
   trackedCampaignIds: string[]

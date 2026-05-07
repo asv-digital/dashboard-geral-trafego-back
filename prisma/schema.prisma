@@ -308,6 +308,10 @@ model Creative {
   productId    String
   campaignId   String?
   name         String
+  // M4 — metaAdId estavel (populado no creative-performance ao primeiro match
+  // por nome). Match heuristico-por-nome continua como fallback pra criativos
+  // sem metaAdId ainda, mas decisoes posteriores reusam o ID estavel.
+  metaAdId     String?
   type         String // video | image | carousel
   status       String @default("active") // active | paused | exhausted
   ctr          Float?

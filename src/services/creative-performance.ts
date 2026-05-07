@@ -32,12 +32,15 @@ export async function syncCreativePerformanceFromInsights(
   );
   const creatives = await prisma.creative.findMany({
     where: { productId, status: { not: "exhausted" } },
-    select: { id: true, name: true, campaignId: true },
+    select: { id: true, name: true, campaignId: true, metaAdId: true },
   });
   if (creatives.length === 0) return;
 
   const creativesByCampaign = new Map<string, typeof creatives>();
+  // Index por metaAdId pra match O(1) — primario, antes de cair no fallback.
+  const creativeByMetaAdId = new Map<string, (typeof creatives)[number]>();
   for (const creative of creatives) {
+    if (creative.metaAdId) creativeByMetaAdId.set(creative.metaAdId, creative);
     if (!creative.campaignId) continue;
     const bucket = creativesByCampaign.get(creative.campaignId) ?? [];
     bucket.push(creative);
@@ -46,6 +49,8 @@ export async function syncCreativePerformanceFromInsights(
 
   const rollups = new Map<string, CreativeRollup>();
   const matchedAdIds = new Set<string>();
+  // Map criativo -> metaAdId pra persistir no fim (evita N updates dentro do loop).
+  const metaAdIdToPersist = new Map<string, string>();
   let minDate: Date | null = null;
   let maxDate: Date | null = null;
 
@@ -53,10 +58,23 @@ export async function syncCreativePerformanceFromInsights(
     const dbCampaignId = campaignByMetaId.get(row.campaign_id);
     if (!dbCampaignId) continue;
 
-    const candidates = creativesByCampaign.get(dbCampaignId) ?? [];
-    const matchedCreative = candidates.find(creative =>
-      creativeMatchesAdName(creative.name, row.ad_name || "")
-    );
+    // M4 — match: primeiro por metaAdId estavel; depois fallback por nome.
+    // Quando o fallback bate, persistimos o metaAdId apos o loop.
+    let matchedCreative: (typeof creatives)[number] | undefined;
+    if (row.ad_id) {
+      matchedCreative = creativeByMetaAdId.get(row.ad_id);
+    }
+    if (!matchedCreative) {
+      const candidates = creativesByCampaign.get(dbCampaignId) ?? [];
+      matchedCreative = candidates.find(creative =>
+        creativeMatchesAdName(creative.name, row.ad_name || "")
+      );
+      if (matchedCreative && row.ad_id && !matchedCreative.metaAdId) {
+        metaAdIdToPersist.set(matchedCreative.id, row.ad_id);
+        // Atualiza index local pra proximas linhas no mesmo loop usarem match O(1).
+        creativeByMetaAdId.set(row.ad_id, { ...matchedCreative, metaAdId: row.ad_id });
+      }
+    }
     if (!matchedCreative) continue;
 
     const rowDate = parseBRTDateStart(row.date_start);
@@ -136,9 +154,18 @@ export async function syncCreativePerformanceFromInsights(
         : null;
     const cpa = sales > 0 ? rollup.spend / sales : null;
 
+    const data: { ctr: number | null; hookRate: number | null; thruplayRate: number | null; cpa: number | null; metaAdId?: string } = {
+      ctr,
+      hookRate,
+      thruplayRate,
+      cpa,
+    };
+    const adIdToPersist = metaAdIdToPersist.get(rollup.creativeId);
+    if (adIdToPersist) data.metaAdId = adIdToPersist;
+
     await prisma.creative.update({
       where: { id: rollup.creativeId },
-      data: { ctr, hookRate, thruplayRate, cpa },
+      data,
     });
   }
 }
