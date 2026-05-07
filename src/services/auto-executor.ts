@@ -219,8 +219,12 @@ async function getAdsetSnapshot(productId: string): Promise<AdsetSnapshot[]> {
         freqWeightTotal: 0,
       };
       existing.spend += m.investment;
-      existing.sales += m.sales;
-      existing.revenue += m.sales * product.netPerSale;
+      // C8: auto-executor decide com salesKirvano (autoritativo via webhook),
+      // nunca com Pixel-attributed. Pause/scale em base de Pixel pode tomar
+      // decisao com venda atribuida errado (UTM falha, dedup duplicado).
+      // m.sales fica disponivel via prisma direto pra dashboard/display.
+      existing.sales += m.salesKirvano;
+      existing.revenue += m.salesKirvano * product.netPerSale;
       const mFreq = m.frequency || 0;
       if (mFreq > 0 && m.impressions > 0) {
         existing.freqWeightedSum += mFreq * m.impressions;

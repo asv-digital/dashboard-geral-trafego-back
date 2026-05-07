@@ -143,22 +143,28 @@ function consolidateInsights(
       }
     }
 
-    // Vendas reais vêm do webhook com escopo por adset quando possível.
-    // Se a venda veio só em nível de campanha, só usamos esse dado quando
-    // houver um único adset naquele campaign/day. Fora isso, o fallback
-    // continua sendo purchase do próprio insight para não duplicar vendas.
+    // Atribuicao de vendas em 2 fontes separadas (gap C8 da auditoria):
+    //   - salesKirvano: autoritativo, vem do webhook com UTM/scoped IDs.
+    //     Adset-level se disponivel; campanha-level so quando ha 1 adset no
+    //     dia (heuristica segura). NUNCA fallback pra Pixel.
+    //   - salesPixel: observabilidade, vem do "purchase" do Insights API.
+    //     Pode duplicar entre adsets ou atribuir errado quando UTM falha.
+    // sales = melhor estimativa (kirvano > pixel fallback) pra dashboard;
+    // auto-executor decide com salesKirvano apenas.
     const adsetScopedSales =
       saleAttribution.byAdsetAndDate.get(attributionKey(date, first.adset_id)) ?? 0;
     const campaignScopedSales =
       saleAttribution.byCampaignAndDate.get(attributionKey(date, first.campaign_id)) ?? 0;
     const adsetsInCampaignDay =
       adsetCountByCampaignDate.get(attributionKey(date, first.campaign_id)) ?? 0;
-    const sales =
+    const salesKirvano =
       adsetScopedSales > 0
         ? adsetScopedSales
         : campaignScopedSales > 0 && adsetsInCampaignDay === 1
           ? campaignScopedSales
-          : metaPurchases;
+          : 0;
+    const salesPixel = metaPurchases;
+    const sales = salesKirvano > 0 ? salesKirvano : salesPixel;
 
     const revenue = sales * netPerSale;
     const hookRate =
@@ -182,6 +188,8 @@ function consolidateInsights(
       clicks: linkClicks > 0 ? linkClicks : clicks,
       linkClicks,
       sales,
+      salesKirvano,
+      salesPixel,
       revenue,
       cpm: impressions > 0 ? (investment / impressions) * 1000 : 0,
       cpc: clicks > 0 ? investment / clicks : 0,
@@ -252,6 +260,8 @@ async function syncToDatabase(
             impressions: m.impressions,
             clicks: m.clicks,
             sales: m.sales,
+            salesKirvano: m.salesKirvano,
+            salesPixel: m.salesPixel,
             frequency: m.frequency,
             hookRate: m.hookRate,
             landingPageViews: m.landingPageViews || null,
@@ -280,6 +290,8 @@ async function syncToDatabase(
             impressions: m.impressions,
             clicks: m.clicks,
             sales: m.sales,
+            salesKirvano: m.salesKirvano,
+            salesPixel: m.salesPixel,
             frequency: m.frequency,
             hookRate: m.hookRate,
             landingPageViews: m.landingPageViews || null,

@@ -48,7 +48,12 @@ export interface ConsolidatedMetric {
   impressions: number;
   clicks: number;
   linkClicks: number;
+  // sales = melhor estimativa (kirvano > pixel fallback). Mantido p/ display.
   sales: number;
+  // salesKirvano = autoritativo (webhook), usado pra decisao automatizada.
+  salesKirvano: number;
+  // salesPixel = observabilidade (purchase do Insights, pode duplicar).
+  salesPixel: number;
   revenue: number;
   cpm: number;
   cpc: number;

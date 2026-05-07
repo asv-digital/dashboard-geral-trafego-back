@@ -258,7 +258,16 @@ model MetricEntry {
   investment  Float
   impressions Int
   clicks      Int
+  // sales = melhor estimativa (salesKirvano > 0 ? salesKirvano : salesPixel).
+  // Mantido pra dashboards/totals.
   sales       Int      @default(0)
+  // salesKirvano = venda confirmada via webhook Kirvano com escopo no adset
+  // (ou na campanha quando ha um unico adset). Autoritativo pra decisao de
+  // pause/scale no auto-executor — Pixel nao decide grana.
+  salesKirvano Int     @default(0)
+  // salesPixel = "purchase" do Insights Meta (Pixel atribuido). Observabilidade
+  // apenas — pode duplicar entre adsets ou atribuir errado quando UTM falha.
+  salesPixel   Int     @default(0)
   frequency   Float    @default(0)
   hookRate    Float?
   observations String?
