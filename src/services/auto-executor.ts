@@ -53,11 +53,17 @@ interface AdsetSnapshot {
   dbCampaignId: string;
   dailyBudget: number;
   isInLearningPhase: boolean;
+  // Adset cuja campanha saiu do learning ha menos de POST_LEARNING_GRACE_MS.
+  // Nessa janela R4-R7 nao aplicam: dados pos-learning sao curtos e pode
+  // pausar/escalar com 1 ponto ruim. Deixa estabilizar.
+  inPostLearningGrace: boolean;
   isASC: boolean;
   totalSpend: number;
   totalSales: number;
   daily: AdsetDaily[];
 }
+
+const POST_LEARNING_GRACE_MS = 48 * 60 * 60 * 1000;
 
 type ExecutionConfig = {
   autoPauseNoSales: boolean;
@@ -251,6 +257,11 @@ async function getAdsetSnapshot(productId: string): Promise<AdsetSnapshot[]> {
     const totalSpend = daily.reduce((s, d) => s + d.spend, 0);
     const totalSales = daily.reduce((s, d) => s + d.sales, 0);
 
+    const inPostLearningGrace =
+      !dbCamp.isInLearningPhase &&
+      !!dbCamp.learningPhaseEnd &&
+      Date.now() - dbCamp.learningPhaseEnd.getTime() < POST_LEARNING_GRACE_MS;
+
     snapshots.push({
       adsetId: a.id,
       adsetName: a.name,
@@ -259,6 +270,7 @@ async function getAdsetSnapshot(productId: string): Promise<AdsetSnapshot[]> {
       dbCampaignId: dbCamp.id,
       dailyBudget: a.dailyBudget,
       isInLearningPhase: dbCamp.isInLearningPhase,
+      inPostLearningGrace,
       isASC:
         dbCamp.name.toUpperCase().includes("ASC") ||
         dbCamp.name.toUpperCase().includes("ADVANTAGE"),
@@ -393,87 +405,128 @@ export async function executeAutomationsForProduct(productId: string): Promise<v
       continue;
     }
 
-    // R4 — auto-pause sem venda
-    if (
-      cfg.autoPauseNoSales &&
-      s.totalSpend > cfg.autoPauseSpendLimit &&
-      s.totalSales === 0
-    ) {
-      const pendingSales = await prisma.sale.count({
-        where: {
-          productId,
-          status: { startsWith: "pending" },
-          OR: [{ metaAdsetId: s.adsetId }, { metaCampaignId: s.metaCampaignId }],
-          createdAt: { gte: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000) },
-        },
-      });
-      if (pendingSales > 0) {
-        const oldest = await prisma.sale.findFirst({
+    // R3.5 — post-learning grace 48h. Adset cuja campanha acabou de sair do
+    // learning nao recebe pause/scale automatico por 48h. Antes do gap o
+    // R4 (no-sales) e o R5/R6 podiam disparar com 1 ponto ruim em janela
+    // curta de dados pos-learning, queimando adset que ainda nao estabilizou.
+    if (s.inPostLearningGrace) {
+      console.log(`[auto:${product.slug}] ${s.adsetName} — post-learning grace 48h`);
+      continue;
+    }
+
+    // R4 — auto-pause sem venda. Cobre 2 cenarios:
+    //  (a) lifetime never sold: totalSales==0 e gasto > limit (loser desde o lancamento)
+    //  (b) streak seco: vendeu antes mas zerou — N dias consecutivos sem venda
+    //      com gasto acumulado > limit (loser que vendeu 1× e morreu)
+    // O cenario (b) era o gap antes: o totalSales 7d agregado mascara dias
+    // recentes secos quando ha 1 venda antiga na janela.
+    if (cfg.autoPauseNoSales && s.totalSpend > cfg.autoPauseSpendLimit) {
+      // Contagem do streak seco do mais recente pra tras.
+      let drySpend = 0;
+      let dryDays = 0;
+      for (let i = s.daily.length - 1; i >= 0; i--) {
+        const d = s.daily[i];
+        if (d.sales > 0) break;
+        if (d.spend > 0) {
+          drySpend += d.spend;
+          dryDays += 1;
+        }
+      }
+      const neverSold = s.totalSales === 0;
+      // Streak: pelo menos 2 dias de gasto sem venda E gasto acumulado > limit.
+      const streakDry = drySpend > cfg.autoPauseSpendLimit && dryDays >= 2;
+      const shouldPause = neverSold || streakDry;
+
+      if (shouldPause) {
+        const pendingSales = await prisma.sale.count({
           where: {
             productId,
             status: { startsWith: "pending" },
             OR: [{ metaAdsetId: s.adsetId }, { metaCampaignId: s.metaCampaignId }],
+            createdAt: { gte: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000) },
           },
-          orderBy: { createdAt: "asc" },
         });
-        const hoursWaiting = oldest
-          ? (Date.now() - oldest.createdAt.getTime()) / (1000 * 60 * 60)
-          : 0;
-        if (hoursWaiting < 48) {
+        if (pendingSales > 0) {
+          const oldest = await prisma.sale.findFirst({
+            where: {
+              productId,
+              status: { startsWith: "pending" },
+              OR: [{ metaAdsetId: s.adsetId }, { metaCampaignId: s.metaCampaignId }],
+            },
+            orderBy: { createdAt: "asc" },
+          });
+          const hoursWaiting = oldest
+            ? (Date.now() - oldest.createdAt.getTime()) / (1000 * 60 * 60)
+            : 0;
+          if (hoursWaiting < 48) {
+            await logAction({
+              productId,
+              action: "pause_delayed_pending_sales",
+              entityType: "adset",
+              entityId: s.adsetId,
+              entityName: s.adsetName,
+              details: `R$${s.totalSpend.toFixed(0)} sem vendas confirmadas, ${pendingSales} boletos pendentes <48h`,
+            });
+            continue;
+          }
+        }
+
+        const lock = await canAutomate(productId, "adset", s.adsetId, "auto_executor");
+        if (!lock.allowed) continue;
+
+        const cause = neverSold ? "lifetime_no_sales" : "dry_streak";
+        const detailLine = neverSold
+          ? `R$${s.totalSpend.toFixed(0)} gastos, 0 vendas. Limite: R$${cfg.autoPauseSpendLimit}`
+          : `Streak ${dryDays}d sem venda, R$${drySpend.toFixed(0)} gastos no streak. Limite: R$${cfg.autoPauseSpendLimit}`;
+        const reasoningLine = neverSold
+          ? `Adset gastou R$${s.totalSpend.toFixed(0)} (acima do limite R$${cfg.autoPauseSpendLimit}) sem nenhuma venda aprovada na janela. Regra R4-A (lifetime_no_sales) disparou. Fora da learning phase, nao e ASC, sem boletos pendentes <48h.`
+          : `Adset vendeu antes mas esta em streak de ${dryDays} dias consecutivos sem venda, com R$${drySpend.toFixed(0)} gastos nesse streak (acima do limite R$${cfg.autoPauseSpendLimit}). Regra R4-B (dry_streak) disparou: 1 venda antiga na janela mascarava o problema, agora o agente pausa por degradacao recente.`;
+
+        if (await pauseAdset(s.adsetId)) {
+          await acquireLock(
+            productId,
+            "adset",
+            s.adsetId,
+            "auto_executor",
+            "pause",
+            String(s.dailyBudget),
+            "0"
+          );
           await logAction({
             productId,
-            action: "pause_delayed_pending_sales",
+            action: "auto_pause_no_sales",
             entityType: "adset",
             entityId: s.adsetId,
             entityName: s.adsetName,
-            details: `R$${s.totalSpend.toFixed(0)} sem vendas, ${pendingSales} boletos pendentes <48h`,
-          });
-          continue;
-        }
-      }
-
-      const lock = await canAutomate(productId, "adset", s.adsetId, "auto_executor");
-      if (!lock.allowed) continue;
-
-      if (await pauseAdset(s.adsetId)) {
-        await acquireLock(
-          productId,
-          "adset",
-          s.adsetId,
-          "auto_executor",
-          "pause",
-          String(s.dailyBudget),
-          "0"
-        );
-        await logAction({
-          productId,
-          action: "auto_pause_no_sales",
-          entityType: "adset",
-          entityId: s.adsetId,
-          entityName: s.adsetName,
-          details: `R$${s.totalSpend.toFixed(0)} gastos, 0 vendas. Limite: R$${cfg.autoPauseSpendLimit}`,
-          reasoning: `Adset gastou R$${s.totalSpend.toFixed(0)} (acima do limite R$${cfg.autoPauseSpendLimit}) sem nenhuma venda aprovada. Regra R4 (auto_pause_no_sales) disparou. Fora da learning phase, não é ASC, não tem boletos pendentes <48h.`,
-          inputSnapshot: {
-            totalSpend: s.totalSpend,
-            totalSales: s.totalSales,
-            spendLimit: cfg.autoPauseSpendLimit,
-            dailyBudget: s.dailyBudget,
-            days: s.daily.length,
-          },
-        });
-        if (cfg.notifyOnAutoAction) {
-          await sendNotification(
-            "auto_action",
-            {
-              action: `PAUSADO (${product.slug})`,
-              adset: s.adsetName,
-              reason: `R$${s.totalSpend.toFixed(0)} sem venda`,
+            details: detailLine,
+            reasoning: reasoningLine,
+            inputSnapshot: {
+              cause,
+              totalSpend: s.totalSpend,
+              totalSales: s.totalSales,
+              drySpend,
+              dryDays,
+              spendLimit: cfg.autoPauseSpendLimit,
+              dailyBudget: s.dailyBudget,
+              days: s.daily.length,
             },
-            productId
-          );
+          });
+          if (cfg.notifyOnAutoAction) {
+            await sendNotification(
+              "auto_action",
+              {
+                action: `PAUSADO (${product.slug})`,
+                adset: s.adsetName,
+                reason: neverSold
+                  ? `R$${s.totalSpend.toFixed(0)} sem venda`
+                  : `${dryDays}d sem venda, R$${drySpend.toFixed(0)} no streak`,
+              },
+              productId
+            );
+          }
         }
+        continue;
       }
-      continue;
     }
 
     // R5 — auto-pause por frequência saturada

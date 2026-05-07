@@ -13,6 +13,28 @@ import { getResolvedProductMetaSettings } from "../lib/runtime-config";
 
 const OFF_PEAK_REDUCTION = 0.5; // reduz pra 50%
 
+// Horas commercial peak no Brasil (11-22 BRT). Volume baixo nessas faixas
+// nao prova "hora morta de conversao" — pode ser hora morta de tráfego (gasto
+// baixo do adset naquela hora). Sem dados granulares de spend/clicks por hora
+// (MetricEntry e diario, nao horario), a regra mais segura e nunca cortar essas
+// horas. Protege peak commercial.
+//
+// Limitação conhecida: ideal seria CR (sales/clicks) ou CPA (spend/sales) por
+// hora, mas os dados horarios nao existem hoje. Quando houver coleta horaria,
+// trocar este heuristico por CR/CPA-based.
+const PROTECTED_PEAK_HOURS = new Set<number>([11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]);
+
+// Madrugada profunda: comprador BR raramente compra. Sempre off-peak.
+const DEFAULT_DEEP_NIGHT = new Set<number>([3, 4, 5]);
+
+// Volume minimo de vendas pra confiar na distribuicao por hora. < 50 = ruido.
+const MIN_SALES_FOR_DISTRIBUTION = 50;
+
+// Off-peak so pode incluir horas que pertencem ao bottom da distribuicao
+// e estejam abaixo de 60% da mediana — proxy mais conservador que "<50% da media".
+// Maximo 6 horas off-peak (nunca cortar mais que 25% do dia).
+const MAX_OFF_PEAK_HOURS = 6;
+
 async function getOffPeakHours(productId: string): Promise<Set<number>> {
   // Pega vendas por hora dos últimos 14d
   const fourteenDaysAgo = addBRTDays(startOfBRTDay(), -13);
@@ -26,23 +48,36 @@ async function getOffPeakHours(productId: string): Promise<Set<number>> {
     select: { date: true },
   });
 
-  if (sales.length < 20) {
-    // Sem dados suficientes, usa default 1-7 BRT
-    return new Set([1, 2, 3, 4, 5, 6, 7]);
+  if (sales.length < MIN_SALES_FOR_DISTRIBUTION) {
+    // Sem volume confiavel: corta apenas madrugada profunda (3-5 BRT).
+    // Antes era 1-7, mas 1, 2, 6, 7 podem ter conversao real em alguns produtos.
+    return new Set(DEFAULT_DEEP_NIGHT);
   }
 
   const byHour = new Map<number, number>();
+  for (let h = 0; h < 24; h++) byHour.set(h, 0);
   for (const s of sales) {
     const h = hourBRTFromDate(s.date);
     byHour.set(h, (byHour.get(h) || 0) + 1);
   }
 
-  // Off-peak = horas com < 50% da média
-  const avg = sales.length / 24;
-  const offPeak = new Set<number>();
-  for (let h = 0; h < 24; h++) {
-    if ((byHour.get(h) || 0) < avg * 0.5) offPeak.add(h);
+  // Mediana > media: distribuicao de vendas por hora e long-tail (poucas horas
+  // concentram muita venda), media puxa cutoff pra cima e marca peak como off.
+  const counts = Array.from(byHour.values()).sort((a, b) => a - b);
+  const median = counts[Math.floor(counts.length / 2)];
+  const ceiling = median * 0.6;
+
+  // Candidatas: nao protegidas, ordenadas crescente por contagem.
+  const candidates = Array.from(byHour.entries())
+    .filter(([h]) => !PROTECTED_PEAK_HOURS.has(h))
+    .sort((a, b) => a[1] - b[1]);
+
+  const offPeak = new Set<number>(DEFAULT_DEEP_NIGHT);
+  for (const [h, count] of candidates) {
+    if (offPeak.size >= MAX_OFF_PEAK_HOURS) break;
+    if (count < ceiling) offPeak.add(h);
   }
+
   return offPeak;
 }
 
