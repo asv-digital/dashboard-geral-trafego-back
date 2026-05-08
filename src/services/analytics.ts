@@ -1450,6 +1450,391 @@ export async function getDecisionQueue(
 }
 
 // ════════════════════════════════════════════════════════════════
+// 10. TIMESERIES — pra graficos Recharts.
+// Retorna serie temporal de uma metrica em N dias.
+// ════════════════════════════════════════════════════════════════
+
+export type TimeseriesMetric = "cpa" | "roas" | "sales" | "spend" | "cm" | "hookRate";
+
+export interface TimeseriesPoint {
+  date: string; // YYYY-MM-DD
+  value: number | null;
+}
+
+export interface TimeseriesResult {
+  metric: TimeseriesMetric;
+  windowDays: number;
+  points: TimeseriesPoint[];
+  current: number | null;
+  previous: number | null;
+  deltaPct: number | null;
+}
+
+export async function getTimeseries(
+  productId: string,
+  metric: TimeseriesMetric,
+  windowDays = 14
+): Promise<TimeseriesResult> {
+  const product = await prisma.product.findUnique({ where: { id: productId } });
+  if (!product) {
+    return { metric, windowDays, points: [], current: null, previous: null, deltaPct: null };
+  }
+  const cutoff = addBRTDays(startOfBRTDay(), -windowDays);
+
+  // Carrega metrics e sales agregados por dia
+  const [metrics, sales] = await Promise.all([
+    prisma.metricEntry.findMany({
+      where: { productId, date: { gte: cutoff } },
+      select: { date: true, investment: true, salesKirvano: true, hookRate: true, impressions: true, threeSecondViews: true },
+    }),
+    prisma.sale.findMany({
+      where: { productId, status: "approved", date: { gte: cutoff } },
+      select: { date: true, amountGross: true, amountNet: true },
+    }),
+  ]);
+
+  // Mapa por dia
+  const byDate = new Map<
+    string,
+    { spend: number; sales: number; revenueGross: number; revenueNet: number; impressions: number; threeSec: number; hookRateSum: number; hookRateCount: number }
+  >();
+  for (let i = 0; i < windowDays; i++) {
+    const d = addBRTDays(startOfBRTDay(), -i);
+    const k = dateKey(d);
+    byDate.set(k, { spend: 0, sales: 0, revenueGross: 0, revenueNet: 0, impressions: 0, threeSec: 0, hookRateSum: 0, hookRateCount: 0 });
+  }
+  for (const m of metrics) {
+    const k = dateKey(m.date);
+    const e = byDate.get(k);
+    if (!e) continue;
+    e.spend += m.investment;
+    e.sales += m.salesKirvano;
+    e.impressions += m.impressions;
+    e.threeSec += m.threeSecondViews ?? 0;
+    if (typeof m.hookRate === "number") {
+      e.hookRateSum += m.hookRate;
+      e.hookRateCount += 1;
+    }
+  }
+  for (const s of sales) {
+    const k = dateKey(s.date);
+    const e = byDate.get(k);
+    if (!e) continue;
+    e.revenueGross += s.amountGross;
+    e.revenueNet += s.amountNet;
+  }
+
+  const points: TimeseriesPoint[] = Array.from(byDate.entries())
+    .sort()
+    .map(([date, e]) => {
+      let value: number | null = null;
+      if (metric === "spend") value = Math.round(e.spend * 100) / 100;
+      else if (metric === "sales") value = e.sales;
+      else if (metric === "cpa")
+        value = e.sales > 0 ? Math.round((e.spend / e.sales) * 100) / 100 : null;
+      else if (metric === "roas")
+        value = e.spend > 0 ? Math.round((e.revenueGross / e.spend) * 100) / 100 : null;
+      else if (metric === "cm")
+        value = Math.round((e.revenueNet - e.spend) * 100) / 100;
+      else if (metric === "hookRate")
+        value = e.hookRateCount > 0 ? Math.round((e.hookRateSum / e.hookRateCount) * 10) / 10 : null;
+      return { date, value };
+    });
+
+  // Current vs previous (ultimo dia vs media dos ultimos 7d)
+  const last = points[points.length - 1]?.value ?? null;
+  const prev7 = points.slice(-8, -1).filter(p => p.value !== null).map(p => p.value!);
+  const previous =
+    prev7.length > 0 ? prev7.reduce((a, b) => a + b, 0) / prev7.length : null;
+  const deltaPct =
+    last !== null && previous !== null && previous !== 0
+      ? Math.round(((last - previous) / Math.abs(previous)) * 1000) / 10
+      : null;
+
+  return {
+    metric,
+    windowDays,
+    points,
+    current: last,
+    previous: previous !== null ? Math.round(previous * 100) / 100 : null,
+    deltaPct,
+  };
+}
+
+// ════════════════════════════════════════════════════════════════
+// 11. BRIEFING CEO — gerado por LLM cruzando os outros analytics.
+// ════════════════════════════════════════════════════════════════
+
+export interface BriefingResult {
+  productId: string;
+  generatedAt: string;
+  briefing: string; // markdown
+  cached: boolean;
+}
+
+// Cache simples em memoria por productId, TTL 30min.
+const briefingCache = new Map<string, { value: BriefingResult; expiresAt: number }>();
+const BRIEFING_TTL_MS = 30 * 60 * 1000;
+
+export async function getBriefing(
+  productId: string,
+  forceRefresh = false
+): Promise<BriefingResult> {
+  if (!forceRefresh) {
+    const cached = briefingCache.get(productId);
+    if (cached && cached.expiresAt > Date.now()) {
+      return { ...cached.value, cached: true };
+    }
+  }
+
+  const product = await prisma.product.findUnique({ where: { id: productId } });
+  if (!product) {
+    return {
+      productId,
+      generatedAt: new Date().toISOString(),
+      briefing: "Produto não encontrado.",
+      cached: false,
+    };
+  }
+
+  const [waterfall, hitRate, fatigue, decisions, volume] = await Promise.all([
+    getProfitWaterfall(productId, 7),
+    getCreativeHitRate(productId, 30),
+    getFatiguePredictions(productId),
+    getDecisionQueue(productId),
+    getCreativeVolumeScore(productId),
+  ]);
+
+  // Snapshot estruturado pro LLM
+  const snapshot = {
+    produto: product.name,
+    stage: product.stage,
+    janela: "ultimos 7 dias",
+    economia: {
+      receitaBruta: waterfall.grossRevenue,
+      contributionMargin: waterfall.contributionMargin,
+      cmPct: waterfall.contributionMarginPct,
+      vendas: waterfall.approvedSales,
+      profitPerSale: waterfall.profitPerSale,
+      roas: waterfall.roas,
+      deltaReceita: waterfall.delta.grossRevenuePct,
+      deltaCm: waterfall.delta.cmPct,
+      deltaVendas: waterfall.delta.salesPct,
+    },
+    criativos: {
+      hitRate: hitRate.hitRatePct,
+      winners: hitRate.buckets.winner,
+      survivors: hitRate.buckets.survivor,
+      losers: hitRate.buckets.loser,
+      pending: hitRate.buckets.pendingDays + hitRate.buckets.pendingSpend,
+      benchmarkElite: hitRate.benchmark.elite,
+    },
+    poolCriativo: {
+      score: volume.totalScore,
+      grade: volume.grade,
+      launchesUltSemana: volume.launchesLast7d,
+      idadeMediaDias: volume.poolAvgAgeDays,
+    },
+    fadiga: {
+      criticos: fatigue.summary.critical,
+      emQueda: fatigue.summary.declining,
+      saudaveis: fatigue.summary.healthy,
+    },
+    proximasAcoes: decisions.items.slice(0, 5).map(d => ({
+      acao: d.action,
+      titulo: d.title,
+      reasoning: d.reasoning,
+    })),
+  };
+
+  // Tenta gerar via LLM. Se Anthropic não tá configurado, fallback determinístico.
+  let briefing: string;
+  try {
+    const { complete, isLLMConfigured } = await import("../lib/llm");
+    if (await isLLMConfigured()) {
+      const system = `Voce e um gestor de trafego senior estilo Pedro Sobral, escrevendo briefing executivo em PT-BR pra dono do negocio. Use markdown.
+
+Estrutura obrigatoria:
+## Situacao atual
+2-3 linhas. Como o produto esta hoje. Foque em CM, ROAS e tendencia.
+
+## O agente esta fazendo
+2-3 linhas. Resumo das proximas 3 acoes automaticas. Diga POR QUE de cada uma.
+
+## Proximos 7 dias
+2-3 linhas. Projecao realista + 1 alerta se houver.
+
+NAO use jargão de gestor sem explicar (ex: se mencionar "knee", explique). Se algum dado ta zerado/imaturo, fale "ainda sem dado suficiente". Direto, denso, sem floreio.`;
+      const user = `Snapshot do produto:\n\n${JSON.stringify(snapshot, null, 2)}`;
+      briefing = await complete({ system, user, maxTokens: 700, temperature: 0.4 });
+    } else {
+      briefing = fallbackBriefing(snapshot);
+    }
+  } catch (err) {
+    console.error(
+      `[briefing] LLM falhou: ${err instanceof Error ? err.message : String(err)}`
+    );
+    briefing = fallbackBriefing(snapshot);
+  }
+
+  const result: BriefingResult = {
+    productId,
+    generatedAt: new Date().toISOString(),
+    briefing,
+    cached: false,
+  };
+  briefingCache.set(productId, { value: result, expiresAt: Date.now() + BRIEFING_TTL_MS });
+  return result;
+}
+
+function fallbackBriefing(s: {
+  economia: { contributionMargin: number; cmPct: number; vendas: number; roas: number | null; deltaCm: number | null };
+  criativos: { hitRate: number; winners: number; losers: number; benchmarkElite: number };
+  fadiga: { criticos: number; emQueda: number };
+  proximasAcoes: Array<{ titulo: string; reasoning: string }>;
+}): string {
+  const cm = s.economia.contributionMargin;
+  const status = cm > 0 ? "lucrativo" : cm === 0 ? "no zero a zero" : "no prejuizo";
+  const lines: string[] = [];
+  lines.push("## Situacao atual");
+  lines.push(
+    `Produto ${status} nos ultimos 7d (CM R$${cm.toFixed(0)}, ROAS ${s.economia.roas?.toFixed(2) ?? "—"}x, ${s.economia.vendas} vendas)${s.economia.deltaCm !== null ? ` — ${s.economia.deltaCm > 0 ? "+" : ""}${s.economia.deltaCm.toFixed(0)}% CM vs janela anterior` : ""}.`
+  );
+  lines.push("");
+  lines.push("## O agente esta fazendo");
+  if (s.proximasAcoes.length === 0) {
+    lines.push("Sem acoes priorizadas no momento (pipeline saudavel ou sem dado suficiente).");
+  } else {
+    lines.push("Top acoes:");
+    for (const a of s.proximasAcoes.slice(0, 3)) {
+      lines.push(`- **${a.titulo}**: ${a.reasoning}`);
+    }
+  }
+  lines.push("");
+  lines.push("## Proximos 7 dias");
+  lines.push(
+    `Hit rate ${s.criativos.hitRate.toFixed(0)}% (elite ${s.criativos.benchmarkElite}%), ${s.criativos.winners} winners ativos, ${s.criativos.losers} losers a pausar. Fadiga: ${s.fadiga.criticos} criticos / ${s.fadiga.emQueda} em queda. ${s.fadiga.criticos > 0 ? "**Alerta**: substituir criativos criticos antes do CPA explodir." : "Sem alerta urgente."}`
+  );
+  return lines.join("\n");
+}
+
+// ════════════════════════════════════════════════════════════════
+// 12. GLOBAL OVERVIEW — agregado multi-produto pra /global.
+// ════════════════════════════════════════════════════════════════
+
+export interface GlobalOverviewProduct {
+  productId: string;
+  slug: string;
+  name: string;
+  stage: string;
+  spend: number;
+  sales: number;
+  revenue: number;
+  cm: number;
+  cpa: number | null;
+  roas: number | null;
+  alerts: number;
+  health: "elite" | "bom" | "mediano" | "critico";
+}
+
+export interface GlobalOverviewResult {
+  windowDays: number;
+  totals: { spend: number; sales: number; revenue: number; cm: number; cpa: number | null; roas: number | null };
+  products: GlobalOverviewProduct[];
+  topAlerts: Array<{ productSlug: string; type: string; detail: string }>;
+}
+
+export async function getGlobalOverview(windowDays = 7): Promise<GlobalOverviewResult> {
+  const cutoff = addBRTDays(startOfBRTDay(), -windowDays);
+
+  const products = await prisma.product.findMany({
+    where: { status: "active" },
+    orderBy: { createdAt: "desc" },
+  });
+
+  const productResults: GlobalOverviewProduct[] = [];
+  const totals = { spend: 0, sales: 0, revenue: 0, cm: 0 };
+
+  for (const p of products) {
+    const [metricsAgg, salesAgg, alerts] = await Promise.all([
+      prisma.metricEntry.aggregate({
+        where: { productId: p.id, date: { gte: cutoff } },
+        _sum: { investment: true },
+      }),
+      prisma.sale.aggregate({
+        where: { productId: p.id, status: "approved", date: { gte: cutoff } },
+        _sum: { amountGross: true, amountNet: true },
+        _count: true,
+      }),
+      prisma.alertDedup.count({ where: { productId: p.id, lastState: "active" } }),
+    ]);
+
+    const spend = metricsAgg._sum.investment || 0;
+    const sales = salesAgg._count || 0;
+    const revenue = salesAgg._sum.amountGross || 0;
+    const netRevenue = salesAgg._sum.amountNet || 0;
+    const cm = netRevenue - spend;
+    const cpa = sales > 0 ? Math.round((spend / sales) * 100) / 100 : null;
+    const roas = spend > 0 ? Math.round((revenue / spend) * 100) / 100 : null;
+
+    let health: GlobalOverviewProduct["health"];
+    if (cm <= 0 && spend > 0) health = "critico";
+    else if (roas !== null && roas >= 2.5) health = "elite";
+    else if (roas !== null && roas >= 1.6) health = "bom";
+    else health = "mediano";
+
+    totals.spend += spend;
+    totals.sales += sales;
+    totals.revenue += revenue;
+    totals.cm += cm;
+
+    productResults.push({
+      productId: p.id,
+      slug: p.slug,
+      name: p.name,
+      stage: p.stage,
+      spend: Math.round(spend * 100) / 100,
+      sales,
+      revenue: Math.round(revenue * 100) / 100,
+      cm: Math.round(cm * 100) / 100,
+      cpa,
+      roas,
+      alerts,
+      health,
+    });
+  }
+
+  // Top alertas globais
+  const recentAlerts = await prisma.alertDedup.findMany({
+    where: { lastState: "active" },
+    include: { product: { select: { slug: true } } },
+    orderBy: { lastSentAt: "desc" },
+    take: 10,
+  });
+  const topAlerts = recentAlerts.map(a => ({
+    productSlug: a.product?.slug || "?",
+    type: a.key,
+    detail: a.lastState,
+  }));
+
+  productResults.sort((a, b) => b.cm - a.cm); // ranking por profit
+
+  return {
+    windowDays,
+    totals: {
+      spend: Math.round(totals.spend * 100) / 100,
+      sales: totals.sales,
+      revenue: Math.round(totals.revenue * 100) / 100,
+      cm: Math.round(totals.cm * 100) / 100,
+      cpa: totals.sales > 0 ? Math.round((totals.spend / totals.sales) * 100) / 100 : null,
+      roas: totals.spend > 0 ? Math.round((totals.revenue / totals.spend) * 100) / 100 : null,
+    },
+    products: productResults,
+    topAlerts,
+  };
+}
+
+// ════════════════════════════════════════════════════════════════
 // 5. AWARENESS x AUDIENCE TYPE — cross-tab (Schwartz).
 // ════════════════════════════════════════════════════════════════
 

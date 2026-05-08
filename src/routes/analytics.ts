@@ -13,6 +13,10 @@ import {
   getFatiguePredictions,
   getCpaElasticity,
   getDecisionQueue,
+  getTimeseries,
+  getBriefing,
+  getGlobalOverview,
+  type TimeseriesMetric,
 } from "../services/analytics";
 import { classifyAwarenessForProduct } from "../services/awareness-classifier";
 
@@ -85,5 +89,30 @@ router.post(
     res.json(result);
   }
 );
+
+// Onda Visual 1
+router.get("/timeseries/:productId", async (req: Request, res: Response) => {
+  const validMetrics: TimeseriesMetric[] = ["cpa", "roas", "sales", "spend", "cm", "hookRate"];
+  const metric = String(req.query.metric || "spend") as TimeseriesMetric;
+  if (!validMetrics.includes(metric)) {
+    res.status(400).json({ error: "invalid_metric", validMetrics });
+    return;
+  }
+  const days = parseDays(req.query.days, 14, 90);
+  const result = await getTimeseries(String(req.params.productId), metric, days);
+  res.json(result);
+});
+
+router.get("/briefing/:productId", async (req: Request, res: Response) => {
+  const force = req.query.refresh === "true";
+  const result = await getBriefing(String(req.params.productId), force);
+  res.json(result);
+});
+
+router.get("/global-overview", async (req: Request, res: Response) => {
+  const days = parseDays(req.query.days, 7, 90);
+  const result = await getGlobalOverview(days);
+  res.json(result);
+});
 
 export default router;
