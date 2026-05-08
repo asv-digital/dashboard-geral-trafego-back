@@ -845,6 +845,611 @@ export async function getLtvCohort(
 }
 
 // ════════════════════════════════════════════════════════════════
+// 6. CREATIVE VOLUME SCORE (Onda 2.1)
+// Score 0-100 cruzando volume de producao, hit rate e idade media
+// do pool ativo. Identifica quando o pipeline de criativo parou.
+// Tim Burd / Foxwell: elite > 30 launches/mes (~7/semana).
+// ════════════════════════════════════════════════════════════════
+
+export interface CreativeVolumeScoreResult {
+  windowDays: number;
+  launchesLast7d: number;
+  launchesLast30d: number;
+  poolActive: number;
+  poolAvgAgeDays: number;
+  hitRatePct: number;
+  // sub-scores 0-40/40/20
+  volumeScore: number;
+  hitRateScore: number;
+  freshnessScore: number;
+  totalScore: number; // 0-100
+  grade: "elite" | "bom" | "mediano" | "critico";
+  recommendations: string[];
+}
+
+export async function getCreativeVolumeScore(
+  productId: string
+): Promise<CreativeVolumeScoreResult> {
+  const product = await prisma.product.findUnique({
+    where: { id: productId },
+    include: { automationConfig: true },
+  });
+  if (!product) {
+    return {
+      windowDays: 30,
+      launchesLast7d: 0,
+      launchesLast30d: 0,
+      poolActive: 0,
+      poolAvgAgeDays: 0,
+      hitRatePct: 0,
+      volumeScore: 0,
+      hitRateScore: 0,
+      freshnessScore: 0,
+      totalScore: 0,
+      grade: "critico",
+      recommendations: ["Produto sem dados."],
+    };
+  }
+  const econ = thresholdsFor(product);
+  const scaleCPA = econ.autoScaleCPAThreshold;
+
+  const cutoff7 = addBRTDays(startOfBRTDay(), -7);
+  const cutoff30 = addBRTDays(startOfBRTDay(), -30);
+
+  const [c7, c30, active] = await Promise.all([
+    prisma.creative.count({
+      where: { productId, createdAt: { gte: cutoff7 } },
+    }),
+    prisma.creative.findMany({
+      where: { productId, createdAt: { gte: cutoff30 } },
+    }),
+    prisma.creative.findMany({
+      where: { productId, status: "active" },
+      select: { id: true, createdAt: true, cpa: true },
+    }),
+  ]);
+
+  // Hit rate sobre evaluable (CPA != null com sinal)
+  const evaluable = c30.filter(c => c.cpa !== null && c.cpa > 0);
+  const winners = evaluable.filter(c => c.cpa! <= scaleCPA);
+  const hitRatePct =
+    evaluable.length > 0
+      ? Math.round((winners.length / evaluable.length) * 1000) / 10
+      : 0;
+
+  // Pool age
+  const now = Date.now();
+  const ageSum = active.reduce(
+    (acc, c) => acc + (now - c.createdAt.getTime()) / (1000 * 60 * 60 * 24),
+    0
+  );
+  const poolAvgAgeDays = active.length > 0 ? ageSum / active.length : 0;
+
+  // Sub-scores
+  // Volume: target 7/semana (elite). <2 = 0, >=7 = 40, linear.
+  const volumeScore = Math.max(0, Math.min(40, ((c7 - 2) / (7 - 2)) * 40));
+  // Hit rate: target 25% (elite). <12 = 0, >=25 = 40, linear.
+  const hitRateScore = Math.max(0, Math.min(40, ((hitRatePct - 12) / (25 - 12)) * 40));
+  // Freshness: ideal <14d media. >30d = 0, <=14d = 20, linear.
+  const freshnessScore =
+    poolAvgAgeDays <= 14
+      ? 20
+      : poolAvgAgeDays >= 30
+        ? 0
+        : Math.max(0, Math.round((1 - (poolAvgAgeDays - 14) / (30 - 14)) * 20));
+
+  const totalScore = Math.round(volumeScore + hitRateScore + freshnessScore);
+  const grade: CreativeVolumeScoreResult["grade"] =
+    totalScore >= 80
+      ? "elite"
+      : totalScore >= 60
+        ? "bom"
+        : totalScore >= 40
+          ? "mediano"
+          : "critico";
+
+  const recommendations: string[] = [];
+  if (c7 < 2) {
+    recommendations.push(
+      `Pipeline parado: só ${c7} criativo(s) lançado(s) em 7d. Elite ships 5-7/semana.`
+    );
+  } else if (c7 < 5) {
+    recommendations.push(
+      `Volume baixo (${c7} em 7d). Aumente pra 5-7/semana pra sustentar hit rate.`
+    );
+  }
+  if (hitRatePct < 12 && evaluable.length >= 5) {
+    recommendations.push(
+      `Hit rate ${hitRatePct.toFixed(1)}% abaixo de mediano (12%). Revise hooks e Stages of Awareness.`
+    );
+  }
+  if (poolAvgAgeDays > 30) {
+    recommendations.push(
+      `Pool envelhecido (${poolAvgAgeDays.toFixed(0)}d média). Fadiga iminente — substitua os mais antigos.`
+    );
+  }
+  if (recommendations.length === 0) {
+    recommendations.push("Pipeline saudável. Mantenha cadência.");
+  }
+
+  return {
+    windowDays: 30,
+    launchesLast7d: c7,
+    launchesLast30d: c30.length,
+    poolActive: active.length,
+    poolAvgAgeDays: Math.round(poolAvgAgeDays * 10) / 10,
+    hitRatePct,
+    volumeScore: Math.round(volumeScore),
+    hitRateScore: Math.round(hitRateScore),
+    freshnessScore,
+    totalScore,
+    grade,
+    recommendations,
+  };
+}
+
+// ════════════════════════════════════════════════════════════════
+// 7. FATIGUE PREDICTIVO (Onda 2.3)
+// Linear regression sobre hookRate diario. Se slope negativo, estima
+// daysToDeath = (hookRate atual − floor) / |slope|.
+// Floor 5% (abaixo disso vira loser puro).
+// ════════════════════════════════════════════════════════════════
+
+const HOOK_RATE_FLOOR = 5; // % — abaixo morre como criativo
+const FATIGUE_WINDOW_DAYS = 14;
+
+function linearTrend(points: Array<{ x: number; y: number }>): {
+  slope: number;
+  intercept: number;
+  rSquared: number;
+} {
+  const n = points.length;
+  if (n < 2) return { slope: 0, intercept: points[0]?.y ?? 0, rSquared: 0 };
+  const sumX = points.reduce((s, p) => s + p.x, 0);
+  const sumY = points.reduce((s, p) => s + p.y, 0);
+  const sumXY = points.reduce((s, p) => s + p.x * p.y, 0);
+  const sumX2 = points.reduce((s, p) => s + p.x * p.x, 0);
+  const denom = n * sumX2 - sumX * sumX;
+  if (denom === 0) return { slope: 0, intercept: sumY / n, rSquared: 0 };
+  const slope = (n * sumXY - sumX * sumY) / denom;
+  const intercept = (sumY - slope * sumX) / n;
+  // R² simples (sem covariance ajustada)
+  const meanY = sumY / n;
+  const ssTot = points.reduce((s, p) => s + (p.y - meanY) ** 2, 0);
+  const ssRes = points.reduce(
+    (s, p) => s + (p.y - (slope * p.x + intercept)) ** 2,
+    0
+  );
+  const rSquared = ssTot > 0 ? 1 - ssRes / ssTot : 0;
+  return { slope, intercept, rSquared };
+}
+
+export type FatigueStatus = "healthy" | "declining" | "critical" | "no_data";
+
+export interface FatiguePrediction {
+  creativeId: string;
+  name: string;
+  type: string;
+  currentHookRate: number | null;
+  trendSlope: number; // pontos %/dia
+  daysToDeath: number | null;
+  status: FatigueStatus;
+  rSquared: number;
+  pointsAnalyzed: number;
+  reason: string;
+}
+
+export interface FatigueResult {
+  windowDays: number;
+  hookRateFloor: number;
+  predictions: FatiguePrediction[];
+  summary: {
+    healthy: number;
+    declining: number;
+    critical: number;
+    noData: number;
+  };
+}
+
+export async function getFatiguePredictions(
+  productId: string
+): Promise<FatigueResult> {
+  const cutoff = addBRTDays(startOfBRTDay(), -FATIGUE_WINDOW_DAYS);
+
+  const creatives = await prisma.creative.findMany({
+    where: { productId, status: "active" },
+    select: {
+      id: true,
+      name: true,
+      type: true,
+      hookRate: true,
+      dailyMetrics: {
+        where: { date: { gte: cutoff }, hookRate: { not: null } },
+        orderBy: { date: "asc" },
+      },
+    },
+  });
+
+  const predictions: FatiguePrediction[] = [];
+  const summary = { healthy: 0, declining: 0, critical: 0, noData: 0 };
+
+  for (const c of creatives) {
+    const points = c.dailyMetrics
+      .filter(d => typeof d.hookRate === "number")
+      .map((d, i) => ({ x: i, y: d.hookRate as number }));
+
+    let status: FatigueStatus = "no_data";
+    let trendSlope = 0;
+    let rSquared = 0;
+    let daysToDeath: number | null = null;
+    let reason = "Sem dados suficientes (precisa ≥3 dias com hookRate)";
+
+    if (points.length >= 3) {
+      const trend = linearTrend(points);
+      trendSlope = Math.round(trend.slope * 100) / 100;
+      rSquared = Math.round(trend.rSquared * 100) / 100;
+
+      const currentHook = c.hookRate ?? points[points.length - 1].y;
+
+      if (trendSlope >= -0.5) {
+        status = "healthy";
+        reason = `hookRate estavel/subindo (slope ${trendSlope.toFixed(2)})`;
+      } else if (trendSlope >= -1.5) {
+        status = "declining";
+        if (trendSlope < 0 && currentHook > HOOK_RATE_FLOOR) {
+          daysToDeath = Math.round(
+            (currentHook - HOOK_RATE_FLOOR) / Math.abs(trendSlope)
+          );
+        }
+        reason = `hookRate caindo ${Math.abs(trendSlope).toFixed(2)}pp/dia${daysToDeath ? `, ~${daysToDeath}d ate floor ${HOOK_RATE_FLOOR}%` : ""}`;
+      } else {
+        status = "critical";
+        if (trendSlope < 0 && currentHook > HOOK_RATE_FLOOR) {
+          daysToDeath = Math.round(
+            (currentHook - HOOK_RATE_FLOOR) / Math.abs(trendSlope)
+          );
+        }
+        reason = `hookRate despencando (${Math.abs(trendSlope).toFixed(2)}pp/dia)${daysToDeath ? ` — morte em ~${daysToDeath}d` : ""}`;
+      }
+
+      // Confiança baixa se R² ruim
+      if (rSquared < 0.3 && status !== "healthy") {
+        reason += ` [confiança baixa, R²=${rSquared.toFixed(2)}]`;
+      }
+    }
+
+    summary[
+      status === "no_data"
+        ? "noData"
+        : (status as "healthy" | "declining" | "critical")
+    ] += 1;
+
+    predictions.push({
+      creativeId: c.id,
+      name: c.name,
+      type: c.type,
+      currentHookRate: c.hookRate,
+      trendSlope,
+      daysToDeath,
+      status,
+      rSquared,
+      pointsAnalyzed: points.length,
+      reason,
+    });
+  }
+
+  // Ordena: critical → declining → healthy → no_data, e dentro por daysToDeath asc
+  const order: Record<FatigueStatus, number> = {
+    critical: 0,
+    declining: 1,
+    healthy: 2,
+    no_data: 3,
+  };
+  predictions.sort((a, b) => {
+    if (order[a.status] !== order[b.status]) return order[a.status] - order[b.status];
+    const ad = a.daysToDeath ?? 999;
+    const bd = b.daysToDeath ?? 999;
+    return ad - bd;
+  });
+
+  return {
+    windowDays: FATIGUE_WINDOW_DAYS,
+    hookRateFloor: HOOK_RATE_FLOOR,
+    predictions,
+    summary,
+  };
+}
+
+// ════════════════════════════════════════════════════════════════
+// 8. CPA ELASTICITY (Onda 2.4)
+// Detecta o "knee" do scale: ponto onde aumentar budget faz CPA
+// disparar. Lê ActionLog de auto_scale + MetricEntry pre/post.
+// ════════════════════════════════════════════════════════════════
+
+export interface ElasticityPoint {
+  date: string;
+  budgetBefore: number;
+  budgetAfter: number;
+  cpaBefore: number | null;
+  cpaAfter: number | null;
+  cpaDelta: number | null; // %
+  budgetDelta: number; // %
+}
+
+export interface AdsetElasticity {
+  adsetId: string;
+  adsetName: string;
+  events: ElasticityPoint[];
+  kneeBudget: number | null; // budget acima do qual CPA disparou
+  signal: "stable" | "knee_detected" | "no_signal";
+  note: string;
+}
+
+export interface ElasticityResult {
+  windowDays: number;
+  adsets: AdsetElasticity[];
+}
+
+export async function getCpaElasticity(
+  productId: string,
+  windowDays = 60
+): Promise<ElasticityResult> {
+  const cutoff = addBRTDays(startOfBRTDay(), -windowDays);
+
+  const scaleEvents = await prisma.actionLog.findMany({
+    where: {
+      productId,
+      action: "auto_scale",
+      entityType: "adset",
+      executedAt: { gte: cutoff },
+    },
+    orderBy: { executedAt: "asc" },
+  });
+
+  if (scaleEvents.length === 0) {
+    return { windowDays, adsets: [] };
+  }
+
+  // Agrupa por adset
+  const byAdset = new Map<string, typeof scaleEvents>();
+  for (const ev of scaleEvents) {
+    if (!ev.entityId) continue;
+    const arr = byAdset.get(ev.entityId) ?? [];
+    arr.push(ev);
+    byAdset.set(ev.entityId, arr);
+  }
+
+  const adsets: AdsetElasticity[] = [];
+  for (const [adsetId, events] of byAdset) {
+    const sortedEvents = events.sort((a, b) => a.executedAt.getTime() - b.executedAt.getTime());
+    const adsetName = sortedEvents[0]?.entityName ?? adsetId;
+
+    const points: ElasticityPoint[] = [];
+    for (const ev of sortedEvents) {
+      const snap = ev.inputSnapshot as Record<string, unknown> | null;
+      const budgetBefore = typeof snap?.currentBudget === "number" ? snap.currentBudget : 0;
+      const budgetAfter = typeof snap?.newBudget === "number" ? snap.newBudget : 0;
+
+      // Janela 3d antes/depois pra CPA
+      const dateBeforeStart = new Date(ev.executedAt.getTime() - 3 * 24 * 60 * 60 * 1000);
+      const dateAfterEnd = new Date(ev.executedAt.getTime() + 3 * 24 * 60 * 60 * 1000);
+      const dateAfterStart = new Date(ev.executedAt.getTime());
+
+      const [pre, post] = await Promise.all([
+        prisma.metricEntry.aggregate({
+          where: {
+            productId,
+            adSet: adsetName,
+            date: { gte: dateBeforeStart, lt: ev.executedAt },
+          },
+          _sum: { investment: true, salesKirvano: true },
+        }),
+        prisma.metricEntry.aggregate({
+          where: {
+            productId,
+            adSet: adsetName,
+            date: { gte: dateAfterStart, lte: dateAfterEnd },
+          },
+          _sum: { investment: true, salesKirvano: true },
+        }),
+      ]);
+
+      const cpaBefore =
+        (pre._sum.salesKirvano || 0) > 0
+          ? (pre._sum.investment || 0) / pre._sum.salesKirvano!
+          : null;
+      const cpaAfter =
+        (post._sum.salesKirvano || 0) > 0
+          ? (post._sum.investment || 0) / post._sum.salesKirvano!
+          : null;
+
+      const cpaDelta =
+        cpaBefore !== null && cpaAfter !== null && cpaBefore > 0
+          ? Math.round(((cpaAfter - cpaBefore) / cpaBefore) * 1000) / 10
+          : null;
+      const budgetDelta =
+        budgetBefore > 0
+          ? Math.round(((budgetAfter - budgetBefore) / budgetBefore) * 1000) / 10
+          : 0;
+
+      points.push({
+        date: ev.executedAt.toISOString().slice(0, 10),
+        budgetBefore,
+        budgetAfter,
+        cpaBefore: cpaBefore !== null ? Math.round(cpaBefore * 100) / 100 : null,
+        cpaAfter: cpaAfter !== null ? Math.round(cpaAfter * 100) / 100 : null,
+        cpaDelta,
+        budgetDelta,
+      });
+    }
+
+    // Knee detection: primeiro ponto onde cpaDelta > 30% (CPA piorou >30%)
+    const kneePoint = points.find(p => p.cpaDelta !== null && p.cpaDelta > 30);
+    let signal: AdsetElasticity["signal"];
+    let note: string;
+    let kneeBudget: number | null = null;
+    if (kneePoint) {
+      signal = "knee_detected";
+      kneeBudget = kneePoint.budgetBefore;
+      note = `Em ${kneePoint.date}: budget ${kneePoint.budgetBefore}→${kneePoint.budgetAfter} (+${kneePoint.budgetDelta}%) e CPA ${kneePoint.cpaBefore}→${kneePoint.cpaAfter} (+${kneePoint.cpaDelta}%). Knee em R$${kneePoint.budgetBefore}.`;
+    } else if (points.some(p => p.cpaDelta !== null)) {
+      signal = "stable";
+      note = `${points.length} scale(s) sem knee detectado. Pode escalar mais.`;
+    } else {
+      signal = "no_signal";
+      note = `${points.length} scale(s) mas sem CPA pre/post calculavel ainda.`;
+    }
+
+    adsets.push({ adsetId, adsetName, events: points, kneeBudget, signal, note });
+  }
+
+  return { windowDays, adsets };
+}
+
+// ════════════════════════════════════════════════════════════════
+// 9. DECISION QUEUE (Onda 2.2)
+// Cruza tudo pra gerar top N acoes priorizadas hoje. Cada acao tem
+// reasoning + impacto estimado + entidade alvo.
+// ════════════════════════════════════════════════════════════════
+
+export type DecisionAction =
+  | "pause_creative"
+  | "scale_winner"
+  | "replace_copy_awareness_mismatch"
+  | "produce_creatives"
+  | "watch_fatigue"
+  | "reduce_budget"
+  | "investigate_payback"
+  | "tag_assets";
+
+export interface DecisionItem {
+  priority: number; // 1 = top
+  action: DecisionAction;
+  title: string;
+  reasoning: string;
+  entity?: { type: "creative" | "adset" | "product"; id?: string; name?: string };
+  estimatedImpact?: string;
+}
+
+export interface DecisionQueueResult {
+  generatedAt: string;
+  items: DecisionItem[];
+}
+
+export async function getDecisionQueue(
+  productId: string
+): Promise<DecisionQueueResult> {
+  const items: DecisionItem[] = [];
+
+  // Roda 4 analytics em paralelo. Volume e Awareness sao baratos.
+  const [hitRate, fatigue, volume, awareness, waterfall] = await Promise.all([
+    getCreativeHitRate(productId, 30),
+    getFatiguePredictions(productId),
+    getCreativeVolumeScore(productId),
+    getAwarenessAnalytics(productId, 30),
+    getProfitWaterfall(productId, 7),
+  ]);
+
+  // 1. Pause losers (top 3 piores por CPA)
+  hitRate.worstLosers.slice(0, 3).forEach((loser, i) => {
+    items.push({
+      priority: 10 + i,
+      action: "pause_creative",
+      title: `Pausar criativo "${loser.name}"`,
+      reasoning: `Loser há ${loser.daysActive}d com CPA ${
+        loser.cpa ? `R$${loser.cpa}` : "—"
+      } > breakeven. Gasto R$${loser.spendEstimated.toFixed(0)} sem retorno.`,
+      entity: { type: "creative", id: loser.id, name: loser.name },
+      estimatedImpact: `economiza ~R$${(loser.spendEstimated / Math.max(1, loser.daysActive)).toFixed(0)}/dia`,
+    });
+  });
+
+  // 2. Scale winners (top 3)
+  hitRate.topWinners.slice(0, 3).forEach((winner, i) => {
+    items.push({
+      priority: 20 + i,
+      action: "scale_winner",
+      title: `Escalar criativo "${winner.name}"`,
+      reasoning: `Winner ${winner.daysActive}d, CPA R$${winner.cpa?.toFixed(0)} (≤ scale). Velocity ${winner.velocityPerDay.toFixed(2)} venda/dia.`,
+      entity: { type: "creative", id: winner.id, name: winner.name },
+      estimatedImpact: "+20% budget pode dobrar volume com mesmo CPA",
+    });
+  });
+
+  // 3. Fatigue critical
+  fatigue.predictions
+    .filter(p => p.status === "critical" || p.status === "declining")
+    .slice(0, 3)
+    .forEach((p, i) => {
+      items.push({
+        priority: p.status === "critical" ? 5 + i : 30 + i,
+        action: "watch_fatigue",
+        title: `${p.status === "critical" ? "URGENTE: " : ""}Fadiga em "${p.name}"`,
+        reasoning: p.reason,
+        entity: { type: "creative", id: p.creativeId, name: p.name },
+        estimatedImpact: p.daysToDeath
+          ? `~${p.daysToDeath}d até virar loser. Substitua agora.`
+          : undefined,
+      });
+    });
+
+  // 4. Volume baixo
+  if (volume.launchesLast7d < 5) {
+    items.push({
+      priority: 15,
+      action: "produce_creatives",
+      title: `Pipeline de criativo em ${volume.launchesLast7d}/sem`,
+      reasoning: `Elite ships 5-7/semana. Pool age ${volume.poolAvgAgeDays.toFixed(0)}d. Score ${volume.totalScore}/100 (${volume.grade}).`,
+      entity: { type: "product" },
+      estimatedImpact: "evitar vácuo quando atuais fadigarem",
+    });
+  }
+
+  // 5. Awareness mismatch (worst pair com count >= 5)
+  if (awareness.worstPair && awareness.worstPair.winnerRate < 12) {
+    items.push({
+      priority: 25,
+      action: "replace_copy_awareness_mismatch",
+      title: `Mismatch ${awareness.worstPair.stage} × ${awareness.worstPair.audience}`,
+      reasoning: `Combinação tem winner rate ${awareness.worstPair.winnerRate.toFixed(0)}% (abaixo de mediano 12%). Schwartz: copy ${awareness.worstPair.stage} não bate com audiência ${awareness.worstPair.audience}.`,
+      entity: { type: "product" },
+      estimatedImpact: "trocar copy dessa combinação ou mover criativo pra audiência certa",
+    });
+  }
+
+  // 6. Untagged dominante
+  if (awareness.untaggedCount > awareness.taggedCount * 2 && awareness.untaggedCount >= 5) {
+    items.push({
+      priority: 50,
+      action: "tag_assets",
+      title: `Tagear ${awareness.untaggedCount} assets sem awareness`,
+      reasoning: `${awareness.untaggedCount} criativos sem stage Schwartz. Sem tag, não dá pra cruzar copy × audiência.`,
+      entity: { type: "product" },
+      estimatedImpact: "permite recomendações automáticas de mismatch",
+    });
+  }
+
+  // 7. CM negativo
+  if (waterfall.contributionMargin < 0 && waterfall.spend > 0) {
+    items.push({
+      priority: 1,
+      action: "reduce_budget",
+      title: `URGENTE: CM negativo (R$${waterfall.contributionMargin.toFixed(0)} em ${waterfall.windowDays}d)`,
+      reasoning: `Receita não cobre CAC + custos. ROAS ${waterfall.roas?.toFixed(2)}x, profit/venda ${waterfall.profitPerSale ? `R$${waterfall.profitPerSale}` : "—"}.`,
+      entity: { type: "product" },
+      estimatedImpact: "cortar 50% do budget e revisar oferta+criativo antes de continuar",
+    });
+  }
+
+  // Ordena por prioridade e limita top 10
+  items.sort((a, b) => a.priority - b.priority);
+  return {
+    generatedAt: new Date().toISOString(),
+    items: items.slice(0, 10),
+  };
+}
+
+// ════════════════════════════════════════════════════════════════
 // 5. AWARENESS x AUDIENCE TYPE — cross-tab (Schwartz).
 // ════════════════════════════════════════════════════════════════
 

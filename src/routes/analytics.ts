@@ -2,14 +2,19 @@
 // Funcoes em src/services/analytics.ts.
 
 import { Router, Request, Response } from "express";
-import { requireAuth } from "../auth/middleware";
+import { requireAuth, requireRole } from "../auth/middleware";
 import {
   getCreativeHitRate,
   getProfitWaterfall,
   getPaybackCohort,
   getLtvCohort,
   getAwarenessAnalytics,
+  getCreativeVolumeScore,
+  getFatiguePredictions,
+  getCpaElasticity,
+  getDecisionQueue,
 } from "../services/analytics";
+import { classifyAwarenessForProduct } from "../services/awareness-classifier";
 
 const router = Router();
 router.use(requireAuth);
@@ -49,5 +54,36 @@ router.get("/awareness/:productId", async (req: Request, res: Response) => {
   const result = await getAwarenessAnalytics(String(req.params.productId), days);
   res.json(result);
 });
+
+// Onda 2 — endpoints elite-grade
+router.get("/volume-score/:productId", async (req: Request, res: Response) => {
+  const result = await getCreativeVolumeScore(String(req.params.productId));
+  res.json(result);
+});
+
+router.get("/fatigue/:productId", async (req: Request, res: Response) => {
+  const result = await getFatiguePredictions(String(req.params.productId));
+  res.json(result);
+});
+
+router.get("/elasticity/:productId", async (req: Request, res: Response) => {
+  const days = parseDays(req.query.days, 60, 180);
+  const result = await getCpaElasticity(String(req.params.productId), days);
+  res.json(result);
+});
+
+router.get("/decisions/:productId", async (req: Request, res: Response) => {
+  const result = await getDecisionQueue(String(req.params.productId));
+  res.json(result);
+});
+
+router.post(
+  "/classify-awareness/:productId",
+  requireRole("owner", "editor"),
+  async (req: Request, res: Response) => {
+    const result = await classifyAwarenessForProduct(String(req.params.productId));
+    res.json(result);
+  }
+);
 
 export default router;

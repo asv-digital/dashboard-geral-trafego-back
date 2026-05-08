@@ -339,10 +339,37 @@ model Creative {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  product  Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
-  campaign Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  product       Product               @relation(fields: [productId], references: [id], onDelete: Cascade)
+  campaign      Campaign?             @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  dailyMetrics  CreativeDailyMetric[]
 
   @@index([productId, status])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CREATIVE DAILY METRIC — historico diario por creative, alimenta
+// fatigue predictivo (linear regression sobre hookRate/CTR trend).
+// Populado pelo creative-performance no sync diario. Snapshot atual
+// continua no Creative (ctr/hookRate/cpa) pra leitura rapida.
+// ═══════════════════════════════════════════════════════════════
+
+model CreativeDailyMetric {
+  id           String   @id @default(cuid())
+  creativeId   String
+  date         DateTime
+  spend        Float    @default(0)
+  impressions  Int      @default(0)
+  clicks       Int      @default(0)
+  hookRate     Float?
+  ctr          Float?
+  thruplayRate Float?
+  cpa          Float?
+  createdAt    DateTime @default(now())
+
+  creative Creative @relation(fields: [creativeId], references: [id], onDelete: Cascade)
+
+  @@unique([creativeId, date])
+  @@index([creativeId, date])
 }
 
 // ═══════════════════════════════════════════════════════════════

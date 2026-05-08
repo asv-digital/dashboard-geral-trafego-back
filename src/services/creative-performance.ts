@@ -15,6 +15,27 @@ interface CreativeRollup {
   adIds: Set<string>;
 }
 
+// Onda 2.3 — agregacao por (creativeId, date) pra historico diario.
+// Alimenta CreativeDailyMetric usado pelo fatigue predictivo.
+interface CreativeDayKey {
+  creativeId: string;
+  date: Date;
+}
+
+function dayKeyStr(k: CreativeDayKey): string {
+  return `${k.creativeId}|${k.date.toISOString().slice(0, 10)}`;
+}
+
+interface DailyRollup {
+  creativeId: string;
+  date: Date;
+  spend: number;
+  impressions: number;
+  clicks: number;
+  threeSecondViews: number;
+  thruplayViews: number;
+}
+
 export async function syncCreativePerformanceFromInsights(
   productId: string,
   insights: MetaInsight[]
@@ -48,6 +69,7 @@ export async function syncCreativePerformanceFromInsights(
   }
 
   const rollups = new Map<string, CreativeRollup>();
+  const dailyRollups = new Map<string, DailyRollup>();
   const matchedAdIds = new Set<string>();
   // Map criativo -> metaAdId pra persistir no fim (evita N updates dentro do loop).
   const metaAdIdToPersist = new Map<string, string>();
@@ -109,6 +131,29 @@ export async function syncCreativePerformanceFromInsights(
     }
 
     rollups.set(matchedCreative.id, rollup);
+
+    // Daily rollup pra fatigue predictivo (Onda 2.3)
+    const dKey = { creativeId: matchedCreative.id, date: rowDate };
+    const ds = dayKeyStr(dKey);
+    const dr =
+      dailyRollups.get(ds) ?? {
+        creativeId: matchedCreative.id,
+        date: rowDate,
+        spend: 0,
+        impressions: 0,
+        clicks: 0,
+        threeSecondViews: 0,
+        thruplayViews: 0,
+      };
+    dr.spend += parseFloat(row.spend) || 0;
+    dr.impressions += parseInt(row.impressions) || 0;
+    dr.clicks += parseInt(row.clicks) || 0;
+    dr.threeSecondViews += getThreeSecondViews(row);
+    dr.thruplayViews += getActionValue(
+      row.video_thruplay_watched_actions,
+      "video_view"
+    );
+    dailyRollups.set(ds, dr);
   }
 
   if (rollups.size === 0) return;
@@ -167,5 +212,48 @@ export async function syncCreativePerformanceFromInsights(
       where: { id: rollup.creativeId },
       data,
     });
+  }
+
+  // Persiste historico diario (Onda 2.3)
+  for (const dr of dailyRollups.values()) {
+    const ctr = dr.impressions > 0 ? (dr.clicks / dr.impressions) * 100 : null;
+    const hookRate =
+      dr.impressions > 0 ? (dr.threeSecondViews / dr.impressions) * 100 : null;
+    const thruplayRate =
+      dr.impressions > 0 ? (dr.thruplayViews / dr.impressions) * 100 : null;
+    // CPA diario nao calculamos aqui pra evitar overlap com Sale dedup.
+    try {
+      await prisma.creativeDailyMetric.upsert({
+        where: {
+          creativeId_date: {
+            creativeId: dr.creativeId,
+            date: dr.date,
+          },
+        },
+        create: {
+          creativeId: dr.creativeId,
+          date: dr.date,
+          spend: dr.spend,
+          impressions: dr.impressions,
+          clicks: dr.clicks,
+          hookRate,
+          ctr,
+          thruplayRate,
+        },
+        update: {
+          spend: dr.spend,
+          impressions: dr.impressions,
+          clicks: dr.clicks,
+          hookRate,
+          ctr,
+          thruplayRate,
+        },
+      });
+    } catch (err) {
+      console.error(
+        `[creative-perf] daily upsert ${dr.creativeId} ${dr.date.toISOString().slice(0, 10)} falhou:`,
+        err
+      );
+    }
   }
 }
