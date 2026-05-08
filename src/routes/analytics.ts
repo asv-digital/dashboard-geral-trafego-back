@@ -22,6 +22,8 @@ import {
 } from "../services/analytics";
 import { getMonthlyPace } from "../lib/monthly-pace";
 import { classifyAwarenessForProduct } from "../services/awareness-classifier";
+import { getProductPulse } from "../services/pulse";
+import { getProductHeroKpis } from "../services/hero-kpis";
 
 const router = Router();
 router.use(requireAuth);
@@ -133,6 +135,18 @@ router.get("/awareness-mismatches/:productId", async (req: Request, res: Respons
 router.get("/report-ceo/:productId", async (req: Request, res: Response) => {
   const days = parseDays(req.query.days, 7, 90);
   const result = await getCeoReport(String(req.params.productId), days);
+  res.json(result);
+});
+
+router.get("/pulse/:productId", async (req: Request, res: Response) => {
+  const days = parseDays(req.query.days, 7, 90);
+  const result = await getProductPulse(String(req.params.productId), days);
+  res.json(result);
+});
+
+router.get("/hero-kpis/:productId", async (req: Request, res: Response) => {
+  const days = parseDays(req.query.days, 7, 90);
+  const result = await getProductHeroKpis(String(req.params.productId), days);
   res.json(result);
 });
 

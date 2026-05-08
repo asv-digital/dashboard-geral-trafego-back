@@ -85,41 +85,44 @@ router.put("/settings", requireRole("owner"), async (req: Request, res: Response
   res.json({ settings });
 });
 
+async function aggregateProductWindow(productId: string, since: Date, until: Date) {
+  const metricsAgg = await prisma.metricEntry.aggregate({
+    where: { productId, date: { gte: since, lt: until } },
+    _sum: { investment: true, sales: true },
+  });
+  const salesAgg = await prisma.sale.aggregate({
+    where: { productId, status: "approved", date: { gte: since, lt: until } },
+    _sum: { amountGross: true, amountNet: true },
+    _count: true,
+  });
+
+  const spend = metricsAgg._sum.investment || 0;
+  const salesCount = salesAgg._count || 0;
+  const revenue = salesAgg._sum.amountNet || 0;
+  const grossRevenue = salesAgg._sum.amountGross || 0;
+  const profit = revenue - spend;
+  const cpa = salesCount > 0 ? spend / salesCount : 0;
+  const roas = spend > 0 ? revenue / spend : 0;
+
+  return { spend, salesCount, revenue, grossRevenue, profit, cpa, roas };
+}
+
 router.get("/pnl", async (req: Request, res: Response) => {
-  const days = Number(req.query.days || 7);
-  const since = addBRTDays(startOfBRTDay(), -(Math.max(days, 1) - 1));
+  const days = Math.max(Number(req.query.days || 7), 1);
+  const today = startOfBRTDay();
+  const tomorrow = addBRTDays(today, 1);
+  const since = addBRTDays(tomorrow, -days);
+  const previousSince = addBRTDays(since, -days);
 
   const products = await prisma.product.findMany({
     where: { status: "active" },
-    include: {
-      _count: { select: { sales: true } },
-    },
+    include: { _count: { select: { sales: true } } },
   });
 
   const rows = await Promise.all(
     products.map(async p => {
-      const metricsAgg = await prisma.metricEntry.aggregate({
-        where: { productId: p.id, date: { gte: since } },
-        _sum: { investment: true, sales: true },
-      });
-      const salesAgg = await prisma.sale.aggregate({
-        where: {
-          productId: p.id,
-          status: "approved",
-          date: { gte: since },
-        },
-        _sum: { amountGross: true, amountNet: true },
-        _count: true,
-      });
-
-      const spend = metricsAgg._sum.investment || 0;
-      const salesCount = salesAgg._count || 0;
-      const revenue = salesAgg._sum.amountNet || 0;
-      const grossRevenue = salesAgg._sum.amountGross || 0;
-      const profit = revenue - spend;
-      const cpa = salesCount > 0 ? spend / salesCount : 0;
-      const roas = spend > 0 ? revenue / spend : 0;
-
+      const current = await aggregateProductWindow(p.id, since, tomorrow);
+      const previous = await aggregateProductWindow(p.id, previousSince, since);
       return {
         productId: p.id,
         slug: p.slug,
@@ -127,13 +130,8 @@ router.get("/pnl", async (req: Request, res: Response) => {
         status: p.status,
         stage: p.stage,
         dailyBudgetTarget: p.dailyBudgetTarget,
-        spend,
-        salesCount,
-        revenue,
-        grossRevenue,
-        profit,
-        cpa,
-        roas,
+        ...current,
+        previous,
       };
     })
   );
@@ -147,8 +145,17 @@ router.get("/pnl", async (req: Request, res: Response) => {
     }),
     { spend: 0, sales: 0, revenue: 0, profit: 0 }
   );
+  const previousTotals = rows.reduce(
+    (acc, r) => ({
+      spend: acc.spend + r.previous.spend,
+      sales: acc.sales + r.previous.salesCount,
+      revenue: acc.revenue + r.previous.revenue,
+      profit: acc.profit + r.previous.profit,
+    }),
+    { spend: 0, sales: 0, revenue: 0, profit: 0 }
+  );
 
-  res.json({ days, products: rows, totals });
+  res.json({ days, products: rows, totals, previousTotals });
 });
 
 router.get("/activity", async (_req: Request, res: Response) => {
