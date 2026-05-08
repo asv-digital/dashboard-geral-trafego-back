@@ -1,6 +1,19 @@
+// Seed self-contained: nao importa de src/ pra rodar sem precisar do
+// codigo-fonte da aplicacao em runtime de prod (Dockerfile copia so dist).
+// Roda no boot via Dockerfile CMD: npx tsx prisma/seed.ts
+//
+// Cria users a partir de SEED_*_EMAIL + SEED_*_PASSWORD envs. Idempotente —
+// pula user que ja existe.
+
 import "dotenv/config";
-import prisma from "../src/prisma";
-import { hashPassword } from "../src/auth/session";
+import bcrypt from "bcryptjs";
+import pg from "pg";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "@prisma/client";
+
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+const adapter = new PrismaPg(pool);
+const prisma = new PrismaClient({ adapter });
 
 interface SeedUser {
   email: string;
@@ -51,7 +64,7 @@ async function main() {
       console.log(`[seed] user ${u.email} already exists, skipping`);
       continue;
     }
-    const passwordHash = await hashPassword(u.password);
+    const passwordHash = await bcrypt.hash(u.password, 10);
     await prisma.user.create({
       data: { email: u.email, name: u.name, role: u.role, passwordHash },
     });
