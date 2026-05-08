@@ -9,6 +9,7 @@ import { requireAuth, requireRole } from "../auth/middleware";
 import { checkStorageHealth, deleteObject, uploadBuffer, isStorageConfigured } from "../lib/storage";
 import { uploadAssetToMeta } from "../services/content-ingest";
 import { logAction } from "../services/action-log";
+import { generateTextForAsset, updateAssetText } from "../services/creative-text-generator";
 
 const router = Router();
 router.use(requireAuth);
@@ -177,6 +178,78 @@ router.patch("/:id", requireRole("owner", "editor"), async (req: Request, res: R
     res.status(404).json({ error: "not_found" });
   }
 });
+
+// POST /:id/auto-text — gera copy + headline + hook via Anthropic
+router.post(
+  "/:id/auto-text",
+  requireRole("owner", "editor"),
+  async (req: Request, res: Response) => {
+    const assetId = String(req.params.id);
+    const asset = await prisma.productAsset.findUnique({ where: { id: assetId } });
+    if (!asset) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
+    try {
+      const generated = await generateTextForAsset(asset.productId, assetId);
+      await logAction({
+        productId: asset.productId,
+        action: "asset_text_generated",
+        entityType: "asset",
+        entityId: assetId,
+        entityName: asset.name,
+        source: "manual",
+        details: `copy ${generated.copy.length}c · headline ${generated.headline.length}c · hook ${generated.hook.length}c`,
+      });
+      res.json({ generated });
+    } catch (err) {
+      const code = err instanceof Error ? err.message : "internal";
+      const status =
+        code === "anthropic_not_configured"
+          ? 412
+          : code === "asset_not_found"
+            ? 404
+            : code === "asset_type_not_supported"
+              ? 400
+              : 500;
+      res.status(status).json({ error: code });
+    }
+  },
+);
+
+// PATCH /:id/text — edita manualmente { copy?, headline?, hook? }
+const textPatchSchema = z
+  .object({
+    copy: z.string().optional(),
+    headline: z.string().optional(),
+    hook: z.string().optional(),
+  })
+  .strict();
+router.patch(
+  "/:id/text",
+  requireRole("owner", "editor"),
+  async (req: Request, res: Response) => {
+    const parsed = textPatchSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_input", details: parsed.error.issues });
+      return;
+    }
+    const assetId = String(req.params.id);
+    const asset = await prisma.productAsset.findUnique({ where: { id: assetId } });
+    if (!asset) {
+      res.status(404).json({ error: "not_found" });
+      return;
+    }
+    try {
+      await updateAssetText(asset.productId, assetId, parsed.data);
+      const updated = await prisma.productAsset.findUnique({ where: { id: assetId } });
+      res.json({ asset: updated });
+    } catch (err) {
+      const code = err instanceof Error ? err.message : "internal";
+      res.status(code === "asset_not_found" ? 404 : 500).json({ error: code });
+    }
+  },
+);
 
 router.delete("/:id", requireRole("owner", "editor"), async (req: Request, res: Response) => {
   try {

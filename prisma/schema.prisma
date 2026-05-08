@@ -165,8 +165,19 @@ model ProductAsset {
   tags           String?  // CSV: hook,problem,solution
   uploadedBy     String?  // userId
   error          String?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+
+  // Textos vinculados quando type=image|video. Gerados via Anthropic vision
+  // (imagem) ou metadata (video). Editaveis inline na UI. Planner so usa
+  // criativo onde os 3 textos estao preenchidos. Para legacy entries onde
+  // type=copy|headline|hook esses campos ficam null e o conteudo vive em
+  // `content` (campo ja existente acima).
+  generatedCopy     String?
+  generatedHeadline String?
+  generatedHook     String?
+  textGeneratedAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
 
