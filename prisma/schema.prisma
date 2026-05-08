@@ -76,6 +76,12 @@ model Product {
   netPerSale          Float
   mentoriaUpsellValue Float?
   mentoriaUpsellRate  Float?
+  // Profit waterfall: comissão de afiliado paga por venda (% sobre amountGross).
+  // 0 se você não tem afiliado. Ex: 0.30 = 30%.
+  affiliateCommissionRate Float @default(0)
+  // Aliquota de imposto sobre receita liquida. Default 0.06 = Simples Nacional
+  // Anexo III/V. Override pra Lucro Presumido (~0.115) ou Real (variável).
+  taxRate                Float @default(0.06)
 
   // Orçamento
   dailyBudgetTarget Float

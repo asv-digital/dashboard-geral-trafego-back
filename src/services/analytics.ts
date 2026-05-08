@@ -1,6 +1,11 @@
-// Analytics elite-grade: hit rate, profit waterfall, payback cohort,
-// LTV cohort, awareness x CPA. Cada funcao retorna estrutura JSON-friendly
-// pronta pra UI (sem post-processing no front).
+// Analytics elite-grade (Onda 1 — versao aprofundada).
+//
+// Mudancas vs versao previa:
+//   - Hit rate em 3 niveis (winner/survivor/loser) + min spend + velocity + timeline mensal
+//   - Profit waterfall completo (refund/chargeback/comissao/imposto/upsell + delta vs periodo anterior + profit/sale)
+//   - Payback cohort por adset E por criativo + status maturity + considera upsell mentoria
+//   - LTV cohort com LTV/CAC ratio + survival rate + mentoria conversion
+//   - Awareness x audience type (cross-tab Prospeccao/Remarketing/ASC)
 
 import prisma from "../prisma";
 import { addBRTDays, startOfBRTDay } from "./../lib/tz";
@@ -19,36 +24,57 @@ function thresholdsFor(product: Product) {
 }
 
 // ════════════════════════════════════════════════════════════════
-// 1. HIT RATE — % de criativos lancados em N dias que viraram winner.
-// Winner = CPA <= autoScaleCPAThreshold em pelo menos 3 dias com vendas.
+// 1. HIT RATE — 3 niveis, min spend, velocity, timeline mensal.
+// Pedro Sobral way: winner (escala), survivor (mantem), loser (mata).
 // ════════════════════════════════════════════════════════════════
+
+export type CreativeBucket =
+  | "winner"           // CPA <= scaleThreshold E spend >= minSpend
+  | "survivor"         // breakevenCPA < CPA <= scaleThreshold (lucra mas nao escala)
+  | "loser"            // CPA > breakevenCPA (queima)
+  | "pending_days"     // < 3 dias ativo
+  | "pending_spend";   // >= 3 dias mas < min spend (sinal estatistico fraco)
+
+export interface CreativeHitRateItem {
+  id: string;
+  name: string;
+  type: string;
+  bucket: CreativeBucket;
+  cpa: number | null;
+  hookRate: number | null;
+  ctr: number | null;
+  spendEstimated: number; // soma de MetricEntry.investment desde criacao
+  salesEstimated: number;
+  velocityPerDay: number; // vendas/dia ativo
+  daysActive: number;
+}
 
 export interface HitRateResult {
   windowDays: number;
+  thresholds: {
+    breakevenCPA: number;
+    scaleCPA: number;
+    minSpendForEval: number;
+  };
   totalLaunched: number;
-  winners: number;
-  losers: number;
-  pendingEvaluation: number; // criativos lancados mas sem dados suficientes
-  hitRatePct: number;
-  benchmark: { elite: number; mediano: number }; // 25 / 12 (% mercado)
-  topWinners: Array<{
-    id: string;
-    name: string;
-    type: string;
-    cpa: number | null;
-    hookRate: number | null;
-    ctr: number | null;
-    daysActive: number;
+  evaluable: number;
+  buckets: {
+    winner: number;
+    survivor: number;
+    loser: number;
+    pendingDays: number;
+    pendingSpend: number;
+  };
+  hitRatePct: number; // winners / evaluable
+  benchmark: { elite: number; mediano: number };
+  monthly: Array<{
+    month: string; // YYYY-MM
+    launched: number;
+    winners: number;
+    rate: number;
   }>;
-  worstLosers: Array<{
-    id: string;
-    name: string;
-    type: string;
-    cpa: number | null;
-    hookRate: number | null;
-    ctr: number | null;
-    daysActive: number;
-  }>;
+  topWinners: CreativeHitRateItem[];
+  worstLosers: CreativeHitRateItem[];
 }
 
 export async function getCreativeHitRate(
@@ -62,250 +88,485 @@ export async function getCreativeHitRate(
   if (!product) {
     return {
       windowDays,
+      thresholds: { breakevenCPA: 0, scaleCPA: 0, minSpendForEval: 0 },
       totalLaunched: 0,
-      winners: 0,
-      losers: 0,
-      pendingEvaluation: 0,
+      evaluable: 0,
+      buckets: { winner: 0, survivor: 0, loser: 0, pendingDays: 0, pendingSpend: 0 },
       hitRatePct: 0,
       benchmark: { elite: 25, mediano: 12 },
+      monthly: [],
       topWinners: [],
       worstLosers: [],
     };
   }
   const econ = thresholdsFor(product);
-  const winnerCPAThreshold = econ.autoScaleCPAThreshold;
-  const cutoff = addBRTDays(startOfBRTDay(), -windowDays);
+  const breakevenCPA = econ.breakevenCPA;
+  const scaleCPA = econ.autoScaleCPAThreshold;
+  // Regra: precisa de spend >= 1.5x scale CPA pra ter sinal minimo.
+  // Abaixo disso, qualquer CPA observado e ruido — vai pra pending_spend.
+  const minSpendForEval = scaleCPA * 1.5;
 
-  const creatives = await prisma.creative.findMany({
-    where: { productId, createdAt: { gte: cutoff } },
-    orderBy: { createdAt: "desc" },
-  });
+  // Janela maior pra timeline (6m), filtramos windowDays no agregado principal.
+  const cutoffWindow = addBRTDays(startOfBRTDay(), -windowDays);
+  const cutoffMonthly = addBRTDays(startOfBRTDay(), -180);
 
-  let winners = 0;
-  let losers = 0;
-  let pending = 0;
-  const winnersList: HitRateResult["topWinners"] = [];
-  const losersList: HitRateResult["worstLosers"] = [];
+  const [creativesWindow, creativesMonthly] = await Promise.all([
+    prisma.creative.findMany({
+      where: { productId, createdAt: { gte: cutoffWindow } },
+      orderBy: { createdAt: "desc" },
+    }),
+    prisma.creative.findMany({
+      where: { productId, createdAt: { gte: cutoffMonthly } },
+      orderBy: { createdAt: "asc" },
+    }),
+  ]);
 
-  for (const c of creatives) {
-    const ageDays = Math.floor(
-      (Date.now() - c.createdAt.getTime()) / (1000 * 60 * 60 * 24)
+  // Spend estimado por criativo: soma MetricEntry.investment do mesmo
+  // metaAdId (estavel) ou fallback por nome se metaAdId null. Spend e
+  // sales sao estimados — fonte autoritativa de venda continua sendo
+  // Sale (metaAdId). Aqui usamos pra avaliar BUCKET, nao pra grana.
+  const items: CreativeHitRateItem[] = [];
+  const buckets = { winner: 0, survivor: 0, loser: 0, pendingDays: 0, pendingSpend: 0 };
+
+  for (const c of creativesWindow) {
+    const ageDays = Math.max(
+      1,
+      Math.floor((Date.now() - c.createdAt.getTime()) / (1000 * 60 * 60 * 24))
     );
-    const item = {
+
+    // Spend agregado pelo metaAdId (se tiver) — reflete real exposicao.
+    let spendEstimated = 0;
+    if (c.metaAdId) {
+      const adDiag = await prisma.adDiagnostic.aggregate({
+        where: { productId, adId: c.metaAdId, date: { gte: c.createdAt } },
+        _sum: { spend: true },
+      });
+      spendEstimated = adDiag._sum.spend || 0;
+    }
+
+    let salesEstimated = 0;
+    if (c.metaAdId) {
+      const salesAgg = await prisma.sale.count({
+        where: {
+          productId,
+          status: "approved",
+          metaAdId: c.metaAdId,
+          date: { gte: c.createdAt },
+        },
+      });
+      salesEstimated = salesAgg;
+    }
+
+    const cpa = salesEstimated > 0 ? spendEstimated / salesEstimated : c.cpa;
+    const velocityPerDay = salesEstimated / ageDays;
+
+    let bucket: CreativeBucket;
+    if (ageDays < 3) {
+      bucket = "pending_days";
+      buckets.pendingDays += 1;
+    } else if (spendEstimated < minSpendForEval && (cpa === null || cpa === 0)) {
+      bucket = "pending_spend";
+      buckets.pendingSpend += 1;
+    } else if (cpa !== null && cpa > 0 && cpa <= scaleCPA && spendEstimated >= minSpendForEval) {
+      bucket = "winner";
+      buckets.winner += 1;
+    } else if (cpa !== null && cpa > 0 && cpa <= breakevenCPA) {
+      bucket = "survivor";
+      buckets.survivor += 1;
+    } else {
+      bucket = "loser";
+      buckets.loser += 1;
+    }
+
+    items.push({
       id: c.id,
       name: c.name,
       type: c.type,
-      cpa: c.cpa,
+      bucket,
+      cpa: cpa !== null && cpa > 0 ? Math.round(cpa * 100) / 100 : null,
       hookRate: c.hookRate,
       ctr: c.ctr,
+      spendEstimated: Math.round(spendEstimated * 100) / 100,
+      salesEstimated,
+      velocityPerDay: Math.round(velocityPerDay * 100) / 100,
       daysActive: ageDays,
-    };
-    // Pending: < 3 dias ou sem CPA calculado
-    if (ageDays < 3 || c.cpa === null) {
-      pending += 1;
-      continue;
-    }
-    if (c.cpa > 0 && c.cpa <= winnerCPAThreshold) {
-      winners += 1;
-      winnersList.push(item);
-    } else {
-      losers += 1;
-      losersList.push(item);
-    }
+    });
   }
 
-  const total = creatives.length;
-  const evaluated = winners + losers;
-  const hitRatePct = evaluated > 0 ? (winners / evaluated) * 100 : 0;
+  // Timeline mensal (180d) — % winners / evaluable por mes
+  const monthlyMap = new Map<string, { launched: number; winners: number }>();
+  for (const c of creativesMonthly) {
+    const month = c.createdAt.toISOString().slice(0, 7);
+    const e = monthlyMap.get(month) ?? { launched: 0, winners: 0 };
+    e.launched += 1;
+    if (c.cpa !== null && c.cpa > 0 && c.cpa <= scaleCPA) e.winners += 1;
+    monthlyMap.set(month, e);
+  }
+  const monthly = Array.from(monthlyMap.entries())
+    .sort()
+    .map(([month, v]) => ({
+      month,
+      launched: v.launched,
+      winners: v.winners,
+      rate: v.launched > 0 ? Math.round((v.winners / v.launched) * 1000) / 10 : 0,
+    }));
+
+  const evaluable = buckets.winner + buckets.survivor + buckets.loser;
+  const hitRatePct =
+    evaluable > 0 ? Math.round((buckets.winner / evaluable) * 1000) / 10 : 0;
 
   return {
     windowDays,
-    totalLaunched: total,
-    winners,
-    losers,
-    pendingEvaluation: pending,
-    hitRatePct: Math.round(hitRatePct * 10) / 10,
+    thresholds: { breakevenCPA, scaleCPA, minSpendForEval },
+    totalLaunched: creativesWindow.length,
+    evaluable,
+    buckets,
+    hitRatePct,
+    // Benchmark conservador derivado de literatura de mercado (Tim Burd /
+    // Foxwell newsletters citam 20-30% como elite, 10-15% mediano em ecom).
     benchmark: { elite: 25, mediano: 12 },
-    topWinners: winnersList
+    monthly,
+    topWinners: items
+      .filter(i => i.bucket === "winner")
       .sort((a, b) => (a.cpa ?? Infinity) - (b.cpa ?? Infinity))
       .slice(0, 5),
-    worstLosers: losersList
+    worstLosers: items
+      .filter(i => i.bucket === "loser")
       .sort((a, b) => (b.cpa ?? 0) - (a.cpa ?? 0))
       .slice(0, 5),
   };
 }
 
 // ════════════════════════════════════════════════════════════════
-// 2. PROFIT WATERFALL — receita -> fee -> spend -> margem.
-// Mostra quanto vc levou pra casa, nao ROAS de vaidade.
+// 2. PROFIT WATERFALL — completo, com refund/chargeback/comissao/
+// imposto/upsell + delta vs periodo anterior + profit per sale.
 // ════════════════════════════════════════════════════════════════
+
+export interface ProfitWaterfallStep {
+  label: string;
+  value: number;
+  pct: number;
+  kind: "input" | "deduction" | "addition" | "result";
+}
 
 export interface ProfitWaterfallResult {
   windowDays: number;
-  steps: Array<{ label: string; value: number; pct: number }>;
+  steps: ProfitWaterfallStep[];
+  // Snapshot principal:
+  grossRevenue: number;
+  refundAmount: number;
+  chargebackAmount: number;
+  gatewayFee: number;
+  netRevenue: number;
+  affiliateCommission: number;
+  spend: number;
+  upsellRevenue: number;
+  taxEstimate: number;
   contributionMargin: number;
   contributionMarginPct: number;
   roas: number | null;
-  spend: number;
-  grossRevenue: number;
+  profitPerSale: number | null;
+  approvedSales: number;
+  // Comparativo vs periodo anterior do mesmo tamanho:
+  delta: {
+    grossRevenuePct: number | null;
+    cmPct: number | null;
+    salesPct: number | null;
+  };
+}
+
+async function aggregateProfit(
+  productId: string,
+  product: Product,
+  from: Date,
+  to: Date
+) {
+  const [salesByStatus, mentoria, metricsAgg] = await Promise.all([
+    prisma.sale.groupBy({
+      by: ["status"],
+      where: { productId, date: { gte: from, lt: to } },
+      _sum: { amountGross: true, amountNet: true },
+      _count: true,
+    }),
+    prisma.sale.aggregate({
+      where: {
+        productId,
+        status: "approved",
+        date: { gte: from, lt: to },
+        convertedToMentoria: true,
+      },
+      _count: true,
+    }),
+    prisma.metricEntry.aggregate({
+      where: { productId, date: { gte: from, lt: to } },
+      _sum: { investment: true },
+    }),
+  ]);
+
+  const approvedRow = salesByStatus.find(s => s.status === "approved");
+  const refundRow = salesByStatus.find(s => s.status === "refunded");
+  const chargebackRow = salesByStatus.find(s => s.status === "chargeback");
+
+  const grossRevenue = approvedRow?._sum.amountGross || 0;
+  const netRevenueRaw = approvedRow?._sum.amountNet || 0;
+  const approvedSales = approvedRow?._count || 0;
+  const refundAmount = refundRow?._sum.amountGross || 0;
+  const chargebackAmount = chargebackRow?._sum.amountGross || 0;
+  const gatewayFee = grossRevenue - netRevenueRaw;
+  const affiliateCommission = grossRevenue * (product.affiliateCommissionRate || 0);
+  const spend = metricsAgg._sum.investment || 0;
+  const mentoriaCount = mentoria._count || 0;
+  const upsellRevenue = mentoriaCount * (product.mentoriaUpsellValue || 0);
+  // Receita liquida apos refund/chargeback/fee/comissao
+  const netRevenue =
+    netRevenueRaw - refundAmount - chargebackAmount - affiliateCommission;
+  // Imposto estimado sobre receita liquida positiva
+  const taxableBase = Math.max(0, netRevenue + upsellRevenue);
+  const taxEstimate = taxableBase * (product.taxRate || 0);
+
+  const cm = netRevenue + upsellRevenue - spend - taxEstimate;
+
+  return {
+    grossRevenue,
+    refundAmount,
+    chargebackAmount,
+    gatewayFee,
+    affiliateCommission,
+    netRevenueRaw,
+    netRevenue,
+    upsellRevenue,
+    spend,
+    taxEstimate,
+    contributionMargin: cm,
+    approvedSales,
+    mentoriaCount,
+  };
 }
 
 export async function getProfitWaterfall(
   productId: string,
   windowDays = 7
 ): Promise<ProfitWaterfallResult> {
-  const product = await prisma.product.findUnique({
-    where: { id: productId },
-  });
+  const product = await prisma.product.findUnique({ where: { id: productId } });
   if (!product) {
     return {
       windowDays,
       steps: [],
+      grossRevenue: 0,
+      refundAmount: 0,
+      chargebackAmount: 0,
+      gatewayFee: 0,
+      netRevenue: 0,
+      affiliateCommission: 0,
+      spend: 0,
+      upsellRevenue: 0,
+      taxEstimate: 0,
       contributionMargin: 0,
       contributionMarginPct: 0,
       roas: null,
-      spend: 0,
-      grossRevenue: 0,
+      profitPerSale: null,
+      approvedSales: 0,
+      delta: { grossRevenuePct: null, cmPct: null, salesPct: null },
     };
   }
-  const cutoff = addBRTDays(startOfBRTDay(), -windowDays);
+  const now = startOfBRTDay();
+  const cutoffNow = addBRTDays(now, -windowDays);
+  const cutoffPrev = addBRTDays(now, -2 * windowDays);
 
-  const [salesAgg, metricsAgg] = await Promise.all([
-    prisma.sale.aggregate({
-      where: { productId, status: "approved", date: { gte: cutoff } },
-      _sum: { amountGross: true, amountNet: true },
-      _count: true,
-    }),
-    prisma.metricEntry.aggregate({
-      where: { productId, date: { gte: cutoff } },
-      _sum: { investment: true },
-    }),
-  ]);
+  const current = await aggregateProfit(productId, product, cutoffNow, now);
+  const previous = await aggregateProfit(productId, product, cutoffPrev, cutoffNow);
 
-  const grossRevenue = salesAgg._sum.amountGross || 0;
-  const netRevenue = salesAgg._sum.amountNet || 0;
-  const gatewayFee = grossRevenue - netRevenue;
-  const spend = metricsAgg._sum.investment || 0;
-  const cm = netRevenue - spend;
-  const cmPct = grossRevenue > 0 ? (cm / grossRevenue) * 100 : 0;
-  const roas = spend > 0 ? grossRevenue / spend : null;
+  const safePct = (n: number) =>
+    current.grossRevenue > 0 ? (n / current.grossRevenue) * 100 : 0;
+  const cmPct = current.grossRevenue > 0
+    ? (current.contributionMargin / current.grossRevenue) * 100
+    : 0;
+  const roas = current.spend > 0 ? current.grossRevenue / current.spend : null;
+  const profitPerSale =
+    current.approvedSales > 0
+      ? current.contributionMargin / current.approvedSales
+      : null;
 
-  const safePct = (n: number) => (grossRevenue > 0 ? (n / grossRevenue) * 100 : 0);
-  const steps = [
-    { label: "Receita bruta", value: grossRevenue, pct: 100 },
-    { label: "− Gateway fee", value: -gatewayFee, pct: -safePct(gatewayFee) },
-    { label: "= Receita líquida", value: netRevenue, pct: safePct(netRevenue) },
-    { label: "− CAC (spend Meta)", value: -spend, pct: -safePct(spend) },
-    {
-      label: "= Contribution margin",
-      value: cm,
-      pct: cmPct,
-    },
+  const steps: ProfitWaterfallStep[] = [
+    { label: "Receita bruta", value: current.grossRevenue, pct: 100, kind: "input" },
+    { label: "− Refund", value: -current.refundAmount, pct: -safePct(current.refundAmount), kind: "deduction" },
+    { label: "− Chargeback", value: -current.chargebackAmount, pct: -safePct(current.chargebackAmount), kind: "deduction" },
+    { label: "− Gateway fee", value: -current.gatewayFee, pct: -safePct(current.gatewayFee), kind: "deduction" },
+    { label: "− Comissão afiliado", value: -current.affiliateCommission, pct: -safePct(current.affiliateCommission), kind: "deduction" },
+    { label: "= Receita líquida", value: current.netRevenue, pct: safePct(current.netRevenue), kind: "result" },
+    { label: "+ Upsell mentoria", value: current.upsellRevenue, pct: safePct(current.upsellRevenue), kind: "addition" },
+    { label: "− CAC (spend Meta)", value: -current.spend, pct: -safePct(current.spend), kind: "deduction" },
+    { label: "− Imposto estimado", value: -current.taxEstimate, pct: -safePct(current.taxEstimate), kind: "deduction" },
+    { label: "= Contribution margin", value: current.contributionMargin, pct: cmPct, kind: "result" },
   ];
+
+  function pctChange(curr: number, prev: number): number | null {
+    if (prev === 0) return curr === 0 ? 0 : null;
+    return Math.round(((curr - prev) / Math.abs(prev)) * 1000) / 10;
+  }
 
   return {
     windowDays,
     steps,
-    contributionMargin: cm,
+    grossRevenue: current.grossRevenue,
+    refundAmount: current.refundAmount,
+    chargebackAmount: current.chargebackAmount,
+    gatewayFee: current.gatewayFee,
+    netRevenue: current.netRevenue,
+    affiliateCommission: current.affiliateCommission,
+    spend: current.spend,
+    upsellRevenue: current.upsellRevenue,
+    taxEstimate: current.taxEstimate,
+    contributionMargin: current.contributionMargin,
     contributionMarginPct: Math.round(cmPct * 10) / 10,
     roas: roas ? Math.round(roas * 100) / 100 : null,
-    spend,
-    grossRevenue,
+    profitPerSale: profitPerSale ? Math.round(profitPerSale * 100) / 100 : null,
+    approvedSales: current.approvedSales,
+    delta: {
+      grossRevenuePct: pctChange(current.grossRevenue, previous.grossRevenue),
+      cmPct: pctChange(current.contributionMargin, previous.contributionMargin),
+      salesPct: pctChange(current.approvedSales, previous.approvedSales),
+    },
   };
 }
 
 // ════════════════════════════════════════════════════════════════
-// 3. PAYBACK COHORT — D1 paid → D7/14/30 cumulative.
-// Pra cada dia: quanto se gastou e quanto retornou em revenue
-// cumulativa do mesmo periodo. Decide ousadia de bid.
+// 3. PAYBACK COHORT — agregado + por adset + por criativo + status
+// maturity. Inclui upsell mentoria no calculo de revenue cumulativo.
 // ════════════════════════════════════════════════════════════════
 
+export type CohortMaturityStatus = "paid" | "in_progress" | "never_paid";
+
 export interface PaybackCohortRow {
-  cohortDate: string; // YYYY-MM-DD
+  cohortDate: string;
   spend: number;
-  cumRevenueD1: number;
-  cumRevenueD7: number;
-  cumRevenueD14: number;
-  cumRevenueD30: number;
-  paybackDay: number | null; // dia em que cumRevenue >= spend (null = nao pagou ainda)
+  cumRevenueD1: number | null; // null = nao maturou ainda
+  cumRevenueD7: number | null;
+  cumRevenueD14: number | null;
+  cumRevenueD30: number | null;
+  paybackDay: number | null;
+  status: CohortMaturityStatus;
+}
+
+export interface PaybackByEntity {
+  name: string;
+  spend: number;
+  revenue: number;
+  paybackDay: number | null;
+  status: CohortMaturityStatus;
 }
 
 export interface PaybackCohortResult {
   windowDays: number;
   rows: PaybackCohortRow[];
   avgPaybackDays: number | null;
+  byAdset: PaybackByEntity[];
+  byCreative: PaybackByEntity[];
+}
+
+interface DailyMoney {
+  date: string; // YYYY-MM-DD
+  spend: number;
+  revenue: number; // amountNet + upsell se mentoria
+}
+
+function dateKey(d: Date): string {
+  return d.toISOString().slice(0, 10);
 }
 
 export async function getPaybackCohort(
   productId: string,
   windowDays = 30
 ): Promise<PaybackCohortResult> {
+  const product = await prisma.product.findUnique({ where: { id: productId } });
+  if (!product) {
+    return { windowDays, rows: [], avgPaybackDays: null, byAdset: [], byCreative: [] };
+  }
   const cutoff = addBRTDays(startOfBRTDay(), -windowDays);
   const now = new Date();
+  const upsellValue = product.mentoriaUpsellValue || 0;
 
-  // Spend por dia (de MetricEntry)
-  const metrics = await prisma.metricEntry.findMany({
-    where: { productId, date: { gte: cutoff } },
-    select: { date: true, investment: true },
-  });
-  const spendByDate = new Map<string, number>();
-  for (const m of metrics) {
-    const k = m.date.toISOString().slice(0, 10);
-    spendByDate.set(k, (spendByDate.get(k) || 0) + m.investment);
+  const [metrics, sales, creatives] = await Promise.all([
+    prisma.metricEntry.findMany({
+      where: { productId, date: { gte: cutoff } },
+      select: { date: true, investment: true, adSet: true, campaignId: true },
+    }),
+    prisma.sale.findMany({
+      where: { productId, status: "approved", date: { gte: cutoff } },
+      select: {
+        date: true,
+        amountNet: true,
+        metaAdsetId: true,
+        metaAdId: true,
+        convertedToMentoria: true,
+      },
+    }),
+    prisma.creative.findMany({
+      where: { productId },
+      select: { id: true, name: true, metaAdId: true },
+    }),
+  ]);
+
+  const adIdToCreativeName = new Map<string, string>();
+  for (const c of creatives) {
+    if (c.metaAdId) adIdToCreativeName.set(c.metaAdId, c.name);
   }
 
-  // Sales por dia (only approved)
-  const sales = await prisma.sale.findMany({
-    where: { productId, status: "approved", date: { gte: cutoff } },
-    select: { date: true, amountNet: true },
-  });
-  const salesByDate = new Map<string, number>();
+  // Dia agregado (produto inteiro)
+  const dailyByDate = new Map<string, DailyMoney>();
+  for (const m of metrics) {
+    const k = dateKey(m.date);
+    const e = dailyByDate.get(k) ?? { date: k, spend: 0, revenue: 0 };
+    e.spend += m.investment;
+    dailyByDate.set(k, e);
+  }
   for (const s of sales) {
-    const k = s.date.toISOString().slice(0, 10);
-    salesByDate.set(k, (salesByDate.get(k) || 0) + s.amountNet);
+    const k = dateKey(s.date);
+    const e = dailyByDate.get(k) ?? { date: k, spend: 0, revenue: 0 };
+    e.revenue += s.amountNet + (s.convertedToMentoria ? upsellValue : 0);
+    dailyByDate.set(k, e);
+  }
+
+  const allDates = Array.from(dailyByDate.keys()).sort();
+  function classifyMaturity(cohortDate: string, paybackDay: number | null): CohortMaturityStatus {
+    if (paybackDay !== null) return "paid";
+    const cohort = new Date(cohortDate + "T00:00:00.000Z");
+    const ageDays = Math.floor((now.getTime() - cohort.getTime()) / (1000 * 60 * 60 * 24));
+    return ageDays >= 30 ? "never_paid" : "in_progress";
+  }
+
+  function calcCum(cohortDate: string, offsetDays: number): number | null {
+    const cohort = new Date(cohortDate + "T00:00:00.000Z");
+    const end = new Date(cohort);
+    end.setUTCDate(end.getUTCDate() + offsetDays);
+    if (end > now) return null; // nao maturou
+    let acc = 0;
+    for (let d = 0; d <= offsetDays; d++) {
+      const date = new Date(cohort);
+      date.setUTCDate(date.getUTCDate() + d);
+      acc += dailyByDate.get(dateKey(date))?.revenue || 0;
+    }
+    return Math.round(acc * 100) / 100;
   }
 
   const rows: PaybackCohortRow[] = [];
-  const allDates = Array.from(
-    new Set([...spendByDate.keys(), ...salesByDate.keys()])
-  ).sort();
-
   let paybackSum = 0;
   let paybackCount = 0;
 
-  for (const cohortDate of allDates) {
-    const spend = spendByDate.get(cohortDate) || 0;
-    if (spend === 0) continue;
+  for (const d of allDates) {
+    const e = dailyByDate.get(d)!;
+    if (e.spend === 0) continue;
 
-    const cohort = new Date(cohortDate + "T00:00:00.000Z");
-    const calcCum = (offsetDays: number): number => {
-      const end = new Date(cohort);
-      end.setUTCDate(end.getUTCDate() + offsetDays);
-      if (end > now) return Number.NaN; // nao maturou ainda
-      let acc = 0;
-      for (let d = 0; d <= offsetDays; d++) {
-        const date = new Date(cohort);
-        date.setUTCDate(date.getUTCDate() + d);
-        acc += salesByDate.get(date.toISOString().slice(0, 10)) || 0;
-      }
-      return acc;
-    };
-
-    const cumD1 = calcCum(1);
-    const cumD7 = calcCum(7);
-    const cumD14 = calcCum(14);
-    const cumD30 = calcCum(30);
-
-    // Dia em que payback ocorreu
-    let paybackDay: number | null = null;
     let acc = 0;
-    for (let d = 0; d <= 60; d++) {
+    let paybackDay: number | null = null;
+    const cohort = new Date(d + "T00:00:00.000Z");
+    for (let day = 0; day <= 60; day++) {
       const date = new Date(cohort);
-      date.setUTCDate(date.getUTCDate() + d);
+      date.setUTCDate(date.getUTCDate() + day);
       if (date > now) break;
-      acc += salesByDate.get(date.toISOString().slice(0, 10)) || 0;
-      if (acc >= spend) {
-        paybackDay = d;
+      acc += dailyByDate.get(dateKey(date))?.revenue || 0;
+      if (acc >= e.spend) {
+        paybackDay = day;
         break;
       }
     }
@@ -313,43 +574,129 @@ export async function getPaybackCohort(
       paybackSum += paybackDay;
       paybackCount += 1;
     }
-
     rows.push({
-      cohortDate,
-      spend: Math.round(spend * 100) / 100,
-      cumRevenueD1: Number.isNaN(cumD1) ? 0 : Math.round(cumD1 * 100) / 100,
-      cumRevenueD7: Number.isNaN(cumD7) ? 0 : Math.round(cumD7 * 100) / 100,
-      cumRevenueD14: Number.isNaN(cumD14) ? 0 : Math.round(cumD14 * 100) / 100,
-      cumRevenueD30: Number.isNaN(cumD30) ? 0 : Math.round(cumD30 * 100) / 100,
+      cohortDate: d,
+      spend: Math.round(e.spend * 100) / 100,
+      cumRevenueD1: calcCum(d, 1),
+      cumRevenueD7: calcCum(d, 7),
+      cumRevenueD14: calcCum(d, 14),
+      cumRevenueD30: calcCum(d, 30),
       paybackDay,
+      status: classifyMaturity(d, paybackDay),
     });
   }
+
+  // Por adset
+  const adsetMap = new Map<string, { spend: number; revenue: number; firstDate: Date }>();
+  for (const m of metrics) {
+    const k = m.adSet || "(sem adset)";
+    const e = adsetMap.get(k) ?? { spend: 0, revenue: 0, firstDate: m.date };
+    e.spend += m.investment;
+    if (m.date < e.firstDate) e.firstDate = m.date;
+    adsetMap.set(k, e);
+  }
+  for (const s of sales) {
+    if (!s.metaAdsetId) continue;
+    // tenta achar nome do adset via MetricEntry
+    const sample = metrics.find(m => m.adSet && m.adSet.length > 0);
+    const k = sample?.adSet || s.metaAdsetId;
+    const e = adsetMap.get(k);
+    if (!e) continue;
+    e.revenue += s.amountNet + (s.convertedToMentoria ? upsellValue : 0);
+  }
+  const byAdset: PaybackByEntity[] = Array.from(adsetMap.entries())
+    .filter(([, v]) => v.spend > 0)
+    .map(([name, v]) => {
+      const ageDays = Math.floor((now.getTime() - v.firstDate.getTime()) / (1000 * 60 * 60 * 24));
+      const paybackDay = v.revenue >= v.spend ? Math.min(ageDays, 60) : null;
+      return {
+        name,
+        spend: Math.round(v.spend * 100) / 100,
+        revenue: Math.round(v.revenue * 100) / 100,
+        paybackDay,
+        status: (paybackDay !== null
+          ? "paid"
+          : ageDays >= 30
+            ? "never_paid"
+            : "in_progress") as CohortMaturityStatus,
+      };
+    })
+    .sort((a, b) => b.spend - a.spend)
+    .slice(0, 10);
+
+  // Por criativo (via metaAdId)
+  const creativeMap = new Map<string, { spend: number; revenue: number; firstDate: Date }>();
+  for (const s of sales) {
+    if (!s.metaAdId) continue;
+    const name = adIdToCreativeName.get(s.metaAdId) || s.metaAdId;
+    const e = creativeMap.get(name) ?? { spend: 0, revenue: 0, firstDate: s.date };
+    e.revenue += s.amountNet + (s.convertedToMentoria ? upsellValue : 0);
+    if (s.date < e.firstDate) e.firstDate = s.date;
+    creativeMap.set(name, e);
+  }
+  // Spend por criativo via AdDiagnostic
+  const diags = await prisma.adDiagnostic.findMany({
+    where: { productId, date: { gte: cutoff } },
+    select: { adId: true, spend: true, date: true },
+  });
+  for (const d of diags) {
+    const name = adIdToCreativeName.get(d.adId) || d.adId;
+    const e = creativeMap.get(name) ?? { spend: 0, revenue: 0, firstDate: d.date };
+    e.spend += d.spend;
+    if (d.date < e.firstDate) e.firstDate = d.date;
+    creativeMap.set(name, e);
+  }
+  const byCreative: PaybackByEntity[] = Array.from(creativeMap.entries())
+    .filter(([, v]) => v.spend > 0)
+    .map(([name, v]) => {
+      const ageDays = Math.floor((now.getTime() - v.firstDate.getTime()) / (1000 * 60 * 60 * 24));
+      const paybackDay = v.revenue >= v.spend ? Math.min(ageDays, 60) : null;
+      return {
+        name,
+        spend: Math.round(v.spend * 100) / 100,
+        revenue: Math.round(v.revenue * 100) / 100,
+        paybackDay,
+        status: (paybackDay !== null
+          ? "paid"
+          : ageDays >= 30
+            ? "never_paid"
+            : "in_progress") as CohortMaturityStatus,
+      };
+    })
+    .sort((a, b) => b.spend - a.spend)
+    .slice(0, 10);
 
   return {
     windowDays,
     rows,
     avgPaybackDays:
       paybackCount > 0 ? Math.round((paybackSum / paybackCount) * 10) / 10 : null,
+    byAdset,
+    byCreative,
   };
 }
 
 // ════════════════════════════════════════════════════════════════
-// 4. LTV COHORT — agrupado por semana de aquisicao.
-// Cada semana: # buyers, revenue cumulativa em N janelas.
+// 4. LTV COHORT — LTV/CAC ratio + survival + mentoria conversion.
 // ════════════════════════════════════════════════════════════════
 
 export interface LtvCohortRow {
-  cohortWeek: string; // ISO week start (YYYY-MM-DD da segunda)
+  cohortWeek: string;
   buyers: number;
+  cac: number; // spend total da semana / buyers (proxy)
   ltvD7: number;
   ltvD14: number;
   ltvD30: number;
   ltvD60: number;
+  ltvCacRatio: number | null; // LTV D60 / CAC
+  mentoriaConvPct: number; // % buyers que converteram pra mentoria
+  retainedD30: number; // % que recompraram em D30
 }
 
 export interface LtvCohortResult {
   windowDays: number;
   rows: LtvCohortRow[];
+  rule: "≥3 = saudavel pra escalar, <2 = problema";
 }
 
 function isoWeekStart(date: Date): string {
@@ -357,7 +704,7 @@ function isoWeekStart(date: Date): string {
   const day = d.getUTCDay() || 7;
   d.setUTCDate(d.getUTCDate() - day + 1);
   d.setUTCHours(0, 0, 0, 0);
-  return d.toISOString().slice(0, 10);
+  return dateKey(d);
 }
 
 export async function getLtvCohort(
@@ -367,14 +714,34 @@ export async function getLtvCohort(
   const cutoff = addBRTDays(startOfBRTDay(), -windowDays);
   const now = new Date();
 
-  // Acha primeira venda de cada email/customer (cohort week)
-  const sales = await prisma.sale.findMany({
-    where: { productId, status: "approved", date: { gte: cutoff } },
-    select: { customerEmail: true, date: true, amountNet: true },
-    orderBy: { date: "asc" },
-  });
+  const product = await prisma.product.findUnique({ where: { id: productId } });
+  const upsellValue = product?.mentoriaUpsellValue || 0;
 
-  // Map customer → primeiro buy date
+  const [sales, metrics] = await Promise.all([
+    prisma.sale.findMany({
+      where: { productId, status: "approved", date: { gte: cutoff } },
+      select: {
+        customerEmail: true,
+        date: true,
+        amountNet: true,
+        convertedToMentoria: true,
+      },
+      orderBy: { date: "asc" },
+    }),
+    prisma.metricEntry.findMany({
+      where: { productId, date: { gte: cutoff } },
+      select: { date: true, investment: true },
+    }),
+  ]);
+
+  // Spend por semana
+  const spendByWeek = new Map<string, number>();
+  for (const m of metrics) {
+    const w = isoWeekStart(m.date);
+    spendByWeek.set(w, (spendByWeek.get(w) || 0) + m.investment);
+  }
+
+  // Primeira compra de cada customer
   const firstBuyByCustomer = new Map<string, Date>();
   for (const s of sales) {
     if (!s.customerEmail) continue;
@@ -383,77 +750,136 @@ export async function getLtvCohort(
     }
   }
 
-  // Agrupa customers por cohortWeek (semana da primeira compra)
+  // Agrupa por cohort week (semana da primeira compra)
   const cohortByWeek = new Map<
     string,
-    { buyers: Set<string>; firstBuyDates: Map<string, Date> }
+    {
+      buyers: Set<string>;
+      firstBuyDates: Map<string, Date>;
+      mentoriaCustomers: Set<string>;
+      retainedByDay: Map<string, Set<number>>; // email -> set of days with new buy
+    }
   >();
   for (const [email, firstDate] of firstBuyByCustomer) {
-    const week = isoWeekStart(firstDate);
-    const entry = cohortByWeek.get(week) ?? {
+    const w = isoWeekStart(firstDate);
+    const e = cohortByWeek.get(w) ?? {
       buyers: new Set<string>(),
       firstBuyDates: new Map<string, Date>(),
+      mentoriaCustomers: new Set<string>(),
+      retainedByDay: new Map<string, Set<number>>(),
     };
-    entry.buyers.add(email);
-    entry.firstBuyDates.set(email, firstDate);
-    cohortByWeek.set(week, entry);
+    e.buyers.add(email);
+    e.firstBuyDates.set(email, firstDate);
+    cohortByWeek.set(w, e);
   }
 
-  // Pra cada cohort, soma revenue desses customers nos D+N days
-  const rows: LtvCohortRow[] = [];
-  const sortedWeeks = Array.from(cohortByWeek.keys()).sort();
+  // Marca mentoria + retained
+  for (const s of sales) {
+    if (!s.customerEmail) continue;
+    const firstBuy = firstBuyByCustomer.get(s.customerEmail);
+    if (!firstBuy) continue;
+    const w = isoWeekStart(firstBuy);
+    const cohort = cohortByWeek.get(w);
+    if (!cohort) continue;
+    if (s.convertedToMentoria) cohort.mentoriaCustomers.add(s.customerEmail);
+    const offsetDays = Math.floor(
+      (s.date.getTime() - firstBuy.getTime()) / (1000 * 60 * 60 * 24)
+    );
+    if (offsetDays > 0) {
+      const days = cohort.retainedByDay.get(s.customerEmail) ?? new Set<number>();
+      days.add(offsetDays);
+      cohort.retainedByDay.set(s.customerEmail, days);
+    }
+  }
 
-  for (const week of sortedWeeks) {
+  const rows: LtvCohortRow[] = [];
+  for (const week of Array.from(cohortByWeek.keys()).sort()) {
     const cohort = cohortByWeek.get(week)!;
     const buyers = cohort.buyers.size;
+    if (buyers === 0) continue;
+
     const calcLtv = (offsetDays: number): number => {
       let total = 0;
       for (const email of cohort.buyers) {
         const firstBuy = cohort.firstBuyDates.get(email)!;
         const cutoffEnd = new Date(firstBuy);
         cutoffEnd.setUTCDate(cutoffEnd.getUTCDate() + offsetDays);
-        if (cutoffEnd > now) {
-          // Cohort ainda nao maturou pra essa janela — soma so o que existe
-        }
+        const cap = cutoffEnd > now ? now : cutoffEnd;
         for (const s of sales) {
           if (s.customerEmail !== email) continue;
-          if (s.date >= firstBuy && s.date <= cutoffEnd) {
-            total += s.amountNet;
+          if (s.date >= firstBuy && s.date <= cap) {
+            total += s.amountNet + (s.convertedToMentoria ? upsellValue : 0);
           }
         }
       }
       return buyers > 0 ? total / buyers : 0;
     };
 
+    const cac = (spendByWeek.get(week) || 0) / buyers;
+    const ltvD60 = calcLtv(60);
+    const ltvCacRatio = cac > 0 ? Math.round((ltvD60 / cac) * 100) / 100 : null;
+    const retainedD30 = Array.from(cohort.retainedByDay.entries()).filter(
+      ([, days]) => Array.from(days).some(d => d <= 30)
+    ).length;
+
     rows.push({
       cohortWeek: week,
       buyers,
+      cac: Math.round(cac * 100) / 100,
       ltvD7: Math.round(calcLtv(7) * 100) / 100,
       ltvD14: Math.round(calcLtv(14) * 100) / 100,
       ltvD30: Math.round(calcLtv(30) * 100) / 100,
-      ltvD60: Math.round(calcLtv(60) * 100) / 100,
+      ltvD60: Math.round(ltvD60 * 100) / 100,
+      ltvCacRatio,
+      mentoriaConvPct:
+        Math.round((cohort.mentoriaCustomers.size / buyers) * 1000) / 10,
+      retainedD30: Math.round((retainedD30 / buyers) * 1000) / 10,
     });
   }
 
-  return { windowDays, rows };
+  return {
+    windowDays,
+    rows,
+    rule: "≥3 = saudavel pra escalar, <2 = problema",
+  };
 }
 
 // ════════════════════════════════════════════════════════════════
-// 5. AWARENESS x CPA — cruzamento copy stage × performance.
+// 5. AWARENESS x AUDIENCE TYPE — cross-tab (Schwartz).
 // ════════════════════════════════════════════════════════════════
 
-export interface AwarenessRow {
-  stage: string;
-  creativeCount: number;
+const AUDIENCE_TYPES = ["Prospecção", "Remarketing", "ASC"] as const;
+type AudienceType = (typeof AUDIENCE_TYPES)[number];
+const STAGES_ORDER = [
+  "unaware",
+  "problem",
+  "solution",
+  "product",
+  "most_aware",
+  "untagged",
+] as const;
+
+export interface AwarenessCell {
+  count: number;
   avgCpa: number | null;
   avgHookRate: number | null;
-  winnerRate: number; // % desses criativos que viraram winner
+  winners: number;
+  winnerRate: number;
+}
+
+export interface AwarenessRowGrouped {
+  stage: string;
+  cells: Record<AudienceType, AwarenessCell>;
+  total: AwarenessCell;
 }
 
 export interface AwarenessResult {
-  rows: AwarenessRow[];
+  audienceTypes: readonly AudienceType[];
+  rows: AwarenessRowGrouped[];
   taggedCount: number;
   untaggedCount: number;
+  bestPair: { stage: string; audience: AudienceType; winnerRate: number } | null;
+  worstPair: { stage: string; audience: AudienceType; winnerRate: number } | null;
 }
 
 export async function getAwarenessAnalytics(
@@ -467,65 +893,138 @@ export async function getAwarenessAnalytics(
     include: { automationConfig: true },
   });
   if (!product) {
-    return { rows: [], taggedCount: 0, untaggedCount: 0 };
+    return {
+      audienceTypes: AUDIENCE_TYPES,
+      rows: [],
+      taggedCount: 0,
+      untaggedCount: 0,
+      bestPair: null,
+      worstPair: null,
+    };
   }
   const econ = thresholdsFor(product);
   const winnerCPAThreshold = econ.autoScaleCPAThreshold;
 
   const creatives = await prisma.creative.findMany({
     where: { productId, createdAt: { gte: cutoff } },
+    include: { campaign: { select: { type: true } } },
   });
 
-  const byStage = new Map<
-    string,
-    { count: number; cpas: number[]; hookRates: number[]; winners: number }
-  >();
-  let untagged = 0;
+  function emptyCell(): AwarenessCell {
+    return { count: 0, avgCpa: null, avgHookRate: null, winners: 0, winnerRate: 0 };
+  }
+  function emptyRow(stage: string): AwarenessRowGrouped {
+    return {
+      stage,
+      cells: {
+        Prospecção: emptyCell(),
+        Remarketing: emptyCell(),
+        ASC: emptyCell(),
+      },
+      total: emptyCell(),
+    };
+  }
 
+  const rowsMap = new Map<string, AwarenessRowGrouped>();
+  for (const stage of STAGES_ORDER) rowsMap.set(stage, emptyRow(stage));
+
+  // Acumuladores temporarios (somas para average)
+  const sums = new Map<
+    string,
+    Record<AudienceType | "total", { cpaSum: number; cpaCount: number; hookSum: number; hookCount: number }>
+  >();
+  function getSums(stage: string) {
+    let s = sums.get(stage);
+    if (!s) {
+      s = {
+        Prospecção: { cpaSum: 0, cpaCount: 0, hookSum: 0, hookCount: 0 },
+        Remarketing: { cpaSum: 0, cpaCount: 0, hookSum: 0, hookCount: 0 },
+        ASC: { cpaSum: 0, cpaCount: 0, hookSum: 0, hookCount: 0 },
+        total: { cpaSum: 0, cpaCount: 0, hookSum: 0, hookCount: 0 },
+      };
+      sums.set(stage, s);
+    }
+    return s;
+  }
+
+  let untagged = 0;
   for (const c of creatives) {
     const stage = c.awarenessStage || "untagged";
-    if (stage === "untagged") untagged += 1;
-    const entry = byStage.get(stage) ?? {
-      count: 0,
-      cpas: [],
-      hookRates: [],
-      winners: 0,
-    };
-    entry.count += 1;
-    if (c.cpa !== null && c.cpa > 0) entry.cpas.push(c.cpa);
-    if (c.hookRate !== null) entry.hookRates.push(c.hookRate);
-    if (c.cpa !== null && c.cpa > 0 && c.cpa <= winnerCPAThreshold) {
-      entry.winners += 1;
+    if (!c.awarenessStage) untagged += 1;
+    const audienceRaw = c.campaign?.type || "Prospecção";
+    const audience: AudienceType = AUDIENCE_TYPES.includes(audienceRaw as AudienceType)
+      ? (audienceRaw as AudienceType)
+      : "Prospecção";
+
+    const row = rowsMap.get(stage) || emptyRow(stage);
+    rowsMap.set(stage, row);
+
+    row.cells[audience].count += 1;
+    row.total.count += 1;
+
+    const ss = getSums(stage);
+    if (c.cpa !== null && c.cpa > 0) {
+      ss[audience].cpaSum += c.cpa;
+      ss[audience].cpaCount += 1;
+      ss.total.cpaSum += c.cpa;
+      ss.total.cpaCount += 1;
+      const isWinner = c.cpa <= winnerCPAThreshold;
+      if (isWinner) {
+        row.cells[audience].winners += 1;
+        row.total.winners += 1;
+      }
     }
-    byStage.set(stage, entry);
+    if (c.hookRate !== null) {
+      ss[audience].hookSum += c.hookRate;
+      ss[audience].hookCount += 1;
+      ss.total.hookSum += c.hookRate;
+      ss.total.hookCount += 1;
+    }
   }
 
-  const stagesOrder = ["unaware", "problem", "solution", "product", "most_aware", "untagged"];
-  const rows: AwarenessRow[] = [];
-  for (const stage of stagesOrder) {
-    const entry = byStage.get(stage);
-    if (!entry || entry.count === 0) continue;
-    const avgCpa =
-      entry.cpas.length > 0
-        ? entry.cpas.reduce((a, b) => a + b, 0) / entry.cpas.length
-        : null;
-    const avgHookRate =
-      entry.hookRates.length > 0
-        ? entry.hookRates.reduce((a, b) => a + b, 0) / entry.hookRates.length
-        : null;
-    rows.push({
-      stage,
-      creativeCount: entry.count,
-      avgCpa: avgCpa !== null ? Math.round(avgCpa * 100) / 100 : null,
-      avgHookRate: avgHookRate !== null ? Math.round(avgHookRate * 10) / 10 : null,
-      winnerRate:
-        entry.count > 0 ? Math.round((entry.winners / entry.count) * 1000) / 10 : 0,
-    });
+  // Calcula averages e winnerRate
+  for (const [stage, row] of rowsMap) {
+    const ss = sums.get(stage);
+    if (!ss) continue;
+    for (const audience of AUDIENCE_TYPES) {
+      const cell = row.cells[audience];
+      const a = ss[audience];
+      cell.avgCpa = a.cpaCount > 0 ? Math.round((a.cpaSum / a.cpaCount) * 100) / 100 : null;
+      cell.avgHookRate = a.hookCount > 0 ? Math.round((a.hookSum / a.hookCount) * 10) / 10 : null;
+      cell.winnerRate = cell.count > 0 ? Math.round((cell.winners / cell.count) * 1000) / 10 : 0;
+    }
+    const total = row.total;
+    const t = ss.total;
+    total.avgCpa = t.cpaCount > 0 ? Math.round((t.cpaSum / t.cpaCount) * 100) / 100 : null;
+    total.avgHookRate = t.hookCount > 0 ? Math.round((t.hookSum / t.hookCount) * 10) / 10 : null;
+    total.winnerRate =
+      total.count > 0 ? Math.round((total.winners / total.count) * 1000) / 10 : 0;
   }
 
+  // best/worst pair (so com count >= 3 pra evitar ruido)
+  let bestPair: AwarenessResult["bestPair"] = null;
+  let worstPair: AwarenessResult["worstPair"] = null;
+  for (const row of rowsMap.values()) {
+    if (row.stage === "untagged") continue;
+    for (const audience of AUDIENCE_TYPES) {
+      const cell = row.cells[audience];
+      if (cell.count < 3) continue;
+      if (!bestPair || cell.winnerRate > bestPair.winnerRate) {
+        bestPair = { stage: row.stage, audience, winnerRate: cell.winnerRate };
+      }
+      if (!worstPair || cell.winnerRate < worstPair.winnerRate) {
+        worstPair = { stage: row.stage, audience, winnerRate: cell.winnerRate };
+      }
+    }
+  }
+
+  const rows = STAGES_ORDER.map(s => rowsMap.get(s)!).filter(r => r.total.count > 0);
   return {
+    audienceTypes: AUDIENCE_TYPES,
     rows,
     taggedCount: creatives.length - untagged,
     untaggedCount: untagged,
+    bestPair,
+    worstPair,
   };
 }
