@@ -109,4 +109,124 @@ router.get("/", async (_req: Request, res: Response) => {
   });
 });
 
+// /health/meta-diagnose
+// Diagnostico profundo do token Meta. Retorna scopes, status da conta,
+// pessoas com acesso, e se token consegue escrever (POST). Nao expoe o token.
+const META_BASE = `https://graph.facebook.com/${process.env.META_GRAPH_VERSION || "v19.0"}`;
+
+router.get("/meta-diagnose", async (_req: Request, res: Response) => {
+  const settings = await getResolvedGlobalSettings();
+  const token = settings.metaAccessToken;
+  const account = settings.metaAdAccountId;
+  if (!token || !account) {
+    res.status(412).json({ error: "missing_token_or_account" });
+    return;
+  }
+
+  const out: Record<string, unknown> = {
+    accountId: account,
+    tokenLength: token.length,
+    tokenPrefix: token.slice(0, 8),
+  };
+
+  // 1. Token info via debug_token (precisa de app_token, mas funciona com user_token tb)
+  try {
+    const r = await fetch(
+      `${META_BASE}/debug_token?input_token=${encodeURIComponent(token)}&access_token=${encodeURIComponent(token)}`,
+    );
+    const j = (await r.json()) as { data?: Record<string, unknown>; error?: { message: string } };
+    if (j.error) {
+      out.tokenInfo = { error: j.error.message };
+    } else if (j.data) {
+      out.tokenInfo = {
+        type: j.data.type,
+        app_id: j.data.app_id,
+        application: j.data.application,
+        user_id: j.data.user_id,
+        is_valid: j.data.is_valid,
+        expires_at: j.data.expires_at,
+        scopes: j.data.scopes,
+      };
+    }
+  } catch (err) {
+    out.tokenInfo = { error: (err as Error).message };
+  }
+
+  // 2. Permissions via /me/permissions
+  try {
+    const r = await fetch(`${META_BASE}/me/permissions?access_token=${encodeURIComponent(token)}`);
+    const j = (await r.json()) as { data?: Array<{ permission: string; status: string }>; error?: { message: string } };
+    if (j.error) {
+      out.permissions = { error: j.error.message };
+    } else {
+      const granted = (j.data ?? []).filter(p => p.status === "granted").map(p => p.permission);
+      const declined = (j.data ?? []).filter(p => p.status !== "granted").map(p => p.permission);
+      out.permissions = {
+        granted,
+        declined,
+        hasAdsRead: granted.includes("ads_read"),
+        hasAdsManagement: granted.includes("ads_management"),
+        hasBusinessManagement: granted.includes("business_management"),
+        hasPagesManageAds: granted.includes("pages_manage_ads"),
+      };
+    }
+  } catch (err) {
+    out.permissions = { error: (err as Error).message };
+  }
+
+  // 3. Conta — read
+  try {
+    const r = await fetch(
+      `${META_BASE}/${account}?fields=account_status,name,currency,disable_reason,users{id,name,role}&access_token=${encodeURIComponent(token)}`,
+    );
+    const j = (await r.json()) as Record<string, unknown> & { error?: { message: string } };
+    if (j.error) {
+      out.accountRead = { error: j.error.message };
+    } else {
+      out.accountRead = {
+        ok: true,
+        account_status: j.account_status,
+        name: j.name,
+        currency: j.currency,
+        disable_reason: j.disable_reason,
+        users: j.users,
+      };
+    }
+  } catch (err) {
+    out.accountRead = { error: (err as Error).message };
+  }
+
+  // 4. Tenta WRITE — POST /adimages com payload invalido. Se erro for de
+  // permissao retorna 100 ou 200; se for de bytes faltando, retorna 100 com
+  // outro codigo. A diferenca expoe se eh write-permission ou nao.
+  try {
+    const body = new URLSearchParams();
+    body.set("access_token", token);
+    body.set("url", "https://example.com/__diagnostic_test__.png");
+    const r = await fetch(`${META_BASE}/${account}/adimages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+    const j = (await r.json()) as Record<string, unknown> & {
+      error?: { code: number; message: string; error_subcode?: number; type?: string };
+    };
+    if (j.error) {
+      out.writeProbe = {
+        ok: false,
+        code: j.error.code,
+        type: j.error.type,
+        subcode: j.error.error_subcode,
+        message: j.error.message,
+      };
+    } else {
+      out.writeProbe = { ok: true, raw: j };
+    }
+  } catch (err) {
+    out.writeProbe = { error: (err as Error).message };
+  }
+
+  res.json(out);
+});
+
 export default router;
