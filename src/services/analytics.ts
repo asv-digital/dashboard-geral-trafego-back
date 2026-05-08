@@ -1742,6 +1742,247 @@ function fallbackBriefing(s: {
 }
 
 // ════════════════════════════════════════════════════════════════
+// 14. CEO REPORT — markdown executivo cruzando tudo (Onda Visual 3).
+// ════════════════════════════════════════════════════════════════
+
+export interface CeoReportResult {
+  productId: string;
+  productName: string;
+  windowDays: number;
+  generatedAt: string;
+  markdown: string;
+}
+
+export async function getCeoReport(
+  productId: string,
+  windowDays = 7
+): Promise<CeoReportResult> {
+  const product = await prisma.product.findUnique({ where: { id: productId } });
+  if (!product) {
+    return {
+      productId,
+      productName: "(?)",
+      windowDays,
+      generatedAt: new Date().toISOString(),
+      markdown: "Produto não encontrado.",
+    };
+  }
+
+  const [waterfall, hitRate, fatigue, decisions, volume, briefing, mismatches] =
+    await Promise.all([
+      getProfitWaterfall(productId, windowDays),
+      getCreativeHitRate(productId, 30),
+      getFatiguePredictions(productId),
+      getDecisionQueue(productId),
+      getCreativeVolumeScore(productId),
+      getBriefing(productId, false),
+      getAwarenessMismatches(productId, 30),
+    ]);
+  const { getMonthlyPace } = await import("../lib/monthly-pace");
+  const pace = await getMonthlyPace(productId);
+
+  const lines: string[] = [];
+  const fmt = (v: number) =>
+    new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(v);
+  const pct = (v: number | null) => (v === null ? "—" : `${v > 0 ? "+" : ""}${v.toFixed(0)}%`);
+
+  // 1. Cabecalho
+  lines.push(`# Relatório CEO — ${product.name}`);
+  lines.push("");
+  lines.push(`**Período:** últimos ${windowDays} dias · **Stage:** ${product.stage}`);
+  lines.push(`**Gerado:** ${new Date().toLocaleString("pt-BR")}`);
+  lines.push("");
+  lines.push("---");
+  lines.push("");
+
+  // 2. Resumo financeiro
+  lines.push("## 1. Resumo financeiro");
+  lines.push("");
+  lines.push(`| Métrica | Valor | Δ vs período anterior |`);
+  lines.push(`|---|---|---|`);
+  lines.push(
+    `| Receita bruta | ${fmt(waterfall.grossRevenue)} | ${pct(waterfall.delta.grossRevenuePct)} |`
+  );
+  lines.push(
+    `| Receita líquida | ${fmt(waterfall.netRevenue)} | — |`
+  );
+  lines.push(
+    `| Spend Meta | ${fmt(waterfall.spend)} | — |`
+  );
+  lines.push(
+    `| **Contribution margin** | **${fmt(waterfall.contributionMargin)} (${waterfall.contributionMarginPct.toFixed(1)}%)** | ${pct(waterfall.delta.cmPct)} |`
+  );
+  lines.push(`| Vendas | ${waterfall.approvedSales} | ${pct(waterfall.delta.salesPct)} |`);
+  lines.push(
+    `| Profit/venda | ${waterfall.profitPerSale !== null ? fmt(waterfall.profitPerSale) : "—"} | — |`
+  );
+  lines.push(
+    `| ROAS | ${waterfall.roas !== null ? `${waterfall.roas.toFixed(2)}x` : "—"} | — |`
+  );
+  lines.push("");
+
+  // Detalhe waterfall
+  lines.push("**Waterfall detalhado:**");
+  lines.push("");
+  for (const step of waterfall.steps) {
+    const prefix = step.kind === "result" ? "**" : "";
+    lines.push(`- ${prefix}${step.label}: ${fmt(step.value)} (${step.pct.toFixed(0)}%)${prefix}`);
+  }
+  lines.push("");
+
+  // 3. Pacing mensal
+  if (pace.status !== "no_goal" && pace.targetSales !== null) {
+    const statusLabel: Record<string, string> = {
+      ahead: "🟢 ADIANTE",
+      on_track: "🔵 NO RITMO",
+      behind: "🟡 ATRÁS",
+      critical: "🔴 CRÍTICO",
+    };
+    lines.push("## 2. Pacing mensal");
+    lines.push("");
+    lines.push(`**Status:** ${statusLabel[pace.status] ?? pace.status}`);
+    lines.push("");
+    lines.push(`- Meta: ${pace.targetSales} vendas em ${pace.daysInMonth} dias`);
+    lines.push(
+      `- Realizado até hoje (D${pace.dayOfMonth}): ${pace.currentSales} vendas (${Math.round((pace.currentSales / pace.targetSales) * 100)}%)`
+    );
+    lines.push(
+      `- Pace projetado linear: ${pace.pace ?? "—"} vendas (${pace.paceRatio !== null ? Math.round(pace.paceRatio * 100) : "—"}% da meta)`
+    );
+    if (pace.requiredDailySales !== null) {
+      lines.push(
+        `- Necessário: ${pace.requiredDailySales} vendas/dia nos próximos ${pace.daysLeft} dias`
+      );
+    }
+    if (pace.scaleThresholdAdjust !== 1.0) {
+      lines.push(
+        `- **Agente ajustou threshold de scale em ×${pace.scaleThresholdAdjust.toFixed(2)}** (${pace.scaleThresholdAdjust > 1 ? "mais agressivo" : "mais conservador"})`
+      );
+    }
+    lines.push("");
+  }
+
+  // 4. Saúde do pool de criativo
+  lines.push(`## ${pace.status !== "no_goal" ? "3" : "2"}. Saúde do pool criativo`);
+  lines.push("");
+  lines.push(
+    `**Score:** ${volume.totalScore}/100 · **Grade:** ${volume.grade.toUpperCase()}`
+  );
+  lines.push("");
+  lines.push(`- Lançamentos últimos 7d: **${volume.launchesLast7d}** (ideal 5-7)`);
+  lines.push(`- Lançamentos últimos 30d: ${volume.launchesLast30d} (ideal 20-30)`);
+  lines.push(`- Pool ativo: ${volume.poolActive} criativos`);
+  lines.push(`- Idade média: **${volume.poolAvgAgeDays.toFixed(1)} dias**`);
+  lines.push(`- Hit rate 30d: ${hitRate.hitRatePct.toFixed(1)}% (elite ${hitRate.benchmark.elite}% / mediano ${hitRate.benchmark.mediano}%)`);
+  lines.push("");
+  if (volume.recommendations.length > 0) {
+    lines.push("**Recomendações pipeline:**");
+    for (const r of volume.recommendations) lines.push(`- ${r}`);
+    lines.push("");
+  }
+
+  // 5. Buckets criativo
+  lines.push("**Distribuição:**");
+  lines.push("");
+  lines.push(`- 🏆 Winners: **${hitRate.buckets.winner}**`);
+  lines.push(`- ✅ Survivors (lucram mas não escalam): ${hitRate.buckets.survivor}`);
+  lines.push(`- 💀 Losers: ${hitRate.buckets.loser}`);
+  lines.push(`- ⏳ Pending (sem dado suficiente): ${hitRate.buckets.pendingDays + hitRate.buckets.pendingSpend}`);
+  lines.push("");
+
+  // Top winners + losers
+  if (hitRate.topWinners.length > 0) {
+    lines.push("**Top winners:**");
+    for (const w of hitRate.topWinners.slice(0, 3)) {
+      lines.push(
+        `- ${w.name} — CPA ${w.cpa ? fmt(w.cpa) : "—"}, ${w.salesEstimated} vendas, ${w.velocityPerDay.toFixed(2)}/d, ${w.daysActive}d ativo`
+      );
+    }
+    lines.push("");
+  }
+  if (hitRate.worstLosers.length > 0) {
+    lines.push("**Piores losers (pausar):**");
+    for (const l of hitRate.worstLosers.slice(0, 3)) {
+      lines.push(
+        `- ${l.name} — CPA ${l.cpa ? fmt(l.cpa) : "—"}, queimou ${fmt(l.spendEstimated)} em ${l.daysActive}d sem retorno`
+      );
+    }
+    lines.push("");
+  }
+
+  // 6. Fadiga
+  if (fatigue.summary.critical > 0 || fatigue.summary.declining > 0) {
+    lines.push(`## ${pace.status !== "no_goal" ? "4" : "3"}. Fadiga predictiva`);
+    lines.push("");
+    lines.push(
+      `🔴 ${fatigue.summary.critical} críticos · 🟡 ${fatigue.summary.declining} em queda · 🟢 ${fatigue.summary.healthy} saudáveis`
+    );
+    lines.push("");
+    const urgent = fatigue.predictions
+      .filter(p => p.status === "critical" || p.status === "declining")
+      .slice(0, 5);
+    if (urgent.length > 0) {
+      for (const p of urgent) {
+        const emoji = p.status === "critical" ? "🔴" : "🟡";
+        lines.push(`- ${emoji} **${p.name}** — ${p.reason}${p.daysToDeath ? ` · morte em ~${p.daysToDeath}d` : ""}`);
+      }
+      lines.push("");
+    }
+  }
+
+  // 7. Awareness mismatches
+  if (mismatches.bySeverity.mismatch > 0 || mismatches.bySeverity.warn > 0) {
+    const sec = pace.status !== "no_goal" ? 5 : 4;
+    lines.push(`## ${sec}. Awareness × Audiência (Schwartz)`);
+    lines.push("");
+    lines.push(
+      `🔴 ${mismatches.bySeverity.mismatch} mismatches graves · 🟡 ${mismatches.bySeverity.warn} fracos · ✅ ${mismatches.bySeverity.ideal} ideais · ⚪ ${mismatches.bySeverity.untagged} sem tag`
+    );
+    lines.push("");
+    const grave = mismatches.items.filter(m => m.matchScore === "mismatch").slice(0, 3);
+    for (const m of grave) {
+      lines.push(`- 🔴 **${m.creativeName}** — stage ${m.awarenessStage} em ${m.audience} (${m.cpa ? fmt(m.cpa) : "CPA —"})`);
+    }
+    if (grave.length > 0) lines.push("");
+  }
+
+  // 8. Decisões priorizadas
+  const sec2 = pace.status !== "no_goal" ? 6 : 5;
+  lines.push(`## ${sec2}. Top 5 ações priorizadas pelo agente`);
+  lines.push("");
+  if (decisions.items.length === 0) {
+    lines.push("Nenhuma ação urgente.");
+  } else {
+    decisions.items.slice(0, 5).forEach((d, i) => {
+      lines.push(`${i + 1}. **${d.title}**`);
+      lines.push(`   - ${d.reasoning}`);
+      if (d.estimatedImpact) lines.push(`   - Impacto: ${d.estimatedImpact}`);
+      lines.push("");
+    });
+  }
+
+  // 9. Briefing IA
+  const sec3 = pace.status !== "no_goal" ? 7 : 6;
+  lines.push(`## ${sec3}. Briefing executivo (IA)`);
+  lines.push("");
+  lines.push(briefing.briefing);
+  lines.push("");
+
+  // 10. Footer
+  lines.push("---");
+  lines.push("");
+  lines.push("_Gerado pelo agente Pedro Sobral integrado · Bravy Dashboard de Tráfego_");
+
+  return {
+    productId,
+    productName: product.name,
+    windowDays,
+    generatedAt: new Date().toISOString(),
+    markdown: lines.join("\n"),
+  };
+}
+
+// ════════════════════════════════════════════════════════════════
 // 13. AWARENESS MISMATCH — Item 1 do roadmap Sobral.
 // Cruza Creative.awarenessStage × Campaign.type. Lista criativos em
 // audiencia errada. Princípio Schwartz aplicado em decisao.

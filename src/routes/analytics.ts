@@ -17,6 +17,7 @@ import {
   getBriefing,
   getGlobalOverview,
   getAwarenessMismatches,
+  getCeoReport,
   type TimeseriesMetric,
 } from "../services/analytics";
 import { getMonthlyPace } from "../lib/monthly-pace";
@@ -126,6 +127,12 @@ router.get("/monthly-pace/:productId", async (req: Request, res: Response) => {
 router.get("/awareness-mismatches/:productId", async (req: Request, res: Response) => {
   const days = parseDays(req.query.days, 30, 90);
   const result = await getAwarenessMismatches(String(req.params.productId), days);
+  res.json(result);
+});
+
+router.get("/report-ceo/:productId", async (req: Request, res: Response) => {
+  const days = parseDays(req.query.days, 7, 90);
+  const result = await getCeoReport(String(req.params.productId), days);
   res.json(result);
 });
 
