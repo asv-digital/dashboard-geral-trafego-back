@@ -10,6 +10,12 @@
 import prisma from "../prisma";
 import { addBRTDays, startOfBRTDay } from "./../lib/tz";
 import { deriveThresholds } from "./../lib/product-economics";
+import {
+  evaluateAwarenessMatch,
+  type AudienceType as AwarenessAudienceType,
+  type AwarenessStage as AwarenessStageType,
+  type CreativeMismatch,
+} from "./../lib/awareness-match";
 
 type Product = NonNullable<Awaited<ReturnType<typeof prisma.product.findUnique>>>;
 
@@ -1341,13 +1347,14 @@ export async function getDecisionQueue(
 ): Promise<DecisionQueueResult> {
   const items: DecisionItem[] = [];
 
-  // Roda 4 analytics em paralelo. Volume e Awareness sao baratos.
-  const [hitRate, fatigue, volume, awareness, waterfall] = await Promise.all([
+  // Roda analytics em paralelo. Volume, Awareness, Mismatches sao baratos.
+  const [hitRate, fatigue, volume, awareness, waterfall, mismatches] = await Promise.all([
     getCreativeHitRate(productId, 30),
     getFatiguePredictions(productId),
     getCreativeVolumeScore(productId),
     getAwarenessAnalytics(productId, 30),
     getProfitWaterfall(productId, 7),
+    getAwarenessMismatches(productId, 30),
   ]);
 
   // 1. Pause losers (top 3 piores por CPA)
@@ -1416,6 +1423,22 @@ export async function getDecisionQueue(
       estimatedImpact: "trocar copy dessa combinação ou mover criativo pra audiência certa",
     });
   }
+
+  // 5b. Mismatches por criativo individual (Item 1 roadmap Sobral).
+  // Lista criativos especificos em audiência errada. Top 3 mais graves.
+  const graveMismatches = mismatches.items
+    .filter(m => m.matchScore === "mismatch")
+    .slice(0, 3);
+  graveMismatches.forEach((m, i) => {
+    items.push({
+      priority: 12 + i,
+      action: "replace_copy_awareness_mismatch",
+      title: `Criativo "${m.creativeName}" em audiência errada`,
+      reasoning: `${m.reason} Stage ${m.awarenessStage} em ${m.audience}. CPA atual ${m.cpa ? `R$${m.cpa.toFixed(0)}` : "—"}.`,
+      entity: { type: "creative", id: m.creativeId, name: m.creativeName },
+      estimatedImpact: "mover criativo pra Remarketing/ASC ou trocar copy pra problem/solution-aware",
+    });
+  });
 
   // 6. Untagged dominante
   if (awareness.untaggedCount > awareness.taggedCount * 2 && awareness.untaggedCount >= 5) {
@@ -1716,6 +1739,81 @@ function fallbackBriefing(s: {
     `Hit rate ${s.criativos.hitRate.toFixed(0)}% (elite ${s.criativos.benchmarkElite}%), ${s.criativos.winners} winners ativos, ${s.criativos.losers} losers a pausar. Fadiga: ${s.fadiga.criticos} criticos / ${s.fadiga.emQueda} em queda. ${s.fadiga.criticos > 0 ? "**Alerta**: substituir criativos criticos antes do CPA explodir." : "Sem alerta urgente."}`
   );
   return lines.join("\n");
+}
+
+// ════════════════════════════════════════════════════════════════
+// 13. AWARENESS MISMATCH — Item 1 do roadmap Sobral.
+// Cruza Creative.awarenessStage × Campaign.type. Lista criativos em
+// audiencia errada. Princípio Schwartz aplicado em decisao.
+// ════════════════════════════════════════════════════════════════
+
+export interface AwarenessMismatchResult {
+  productId: string;
+  total: number;
+  bySeverity: { mismatch: number; warn: number; ok: number; ideal: number; untagged: number };
+  items: CreativeMismatch[];
+}
+
+export async function getAwarenessMismatches(
+  productId: string,
+  windowDays = 30
+): Promise<AwarenessMismatchResult> {
+  const cutoff = addBRTDays(startOfBRTDay(), -windowDays);
+
+  const creatives = await prisma.creative.findMany({
+    where: { productId, status: "active", createdAt: { gte: cutoff } },
+    include: { campaign: { select: { name: true, type: true } } },
+  });
+
+  const bySeverity = { mismatch: 0, warn: 0, ok: 0, ideal: 0, untagged: 0 };
+  const items: CreativeMismatch[] = [];
+
+  for (const c of creatives) {
+    if (!c.awarenessStage) {
+      bySeverity.untagged += 1;
+      continue;
+    }
+    if (!c.campaign?.type) continue;
+
+    const match = evaluateAwarenessMatch(
+      c.awarenessStage as AwarenessStageType,
+      c.campaign.type
+    );
+    if (!match) continue;
+
+    bySeverity[match.score] += 1;
+
+    // So expoe items com problema (warn ou mismatch). Ideal/ok nao precisa
+    // mostrar — sao expectativa.
+    if (match.score === "warn" || match.score === "mismatch") {
+      items.push({
+        creativeId: c.id,
+        creativeName: c.name,
+        awarenessStage: c.awarenessStage as AwarenessStageType,
+        audience: c.campaign.type as AwarenessAudienceType,
+        campaignName: c.campaign.name,
+        cpa: c.cpa,
+        hookRate: c.hookRate,
+        matchScore: match.score,
+        reason: match.reason,
+      });
+    }
+  }
+
+  // Ordena por gravidade (mismatch primeiro, warn depois) + maior CPA primeiro.
+  items.sort((a, b) => {
+    if (a.matchScore !== b.matchScore) {
+      return a.matchScore === "mismatch" ? -1 : 1;
+    }
+    return (b.cpa ?? 0) - (a.cpa ?? 0);
+  });
+
+  return {
+    productId,
+    total: creatives.length,
+    bySeverity,
+    items: items.slice(0, 20),
+  };
 }
 
 // ════════════════════════════════════════════════════════════════

@@ -31,6 +31,7 @@ import { classifyCampaign } from "./budget-guard";
 import { getResolvedProductMetaSettings } from "../lib/runtime-config";
 import { addBRTDays, dateStringBRT, startOfBRTDay } from "../lib/tz";
 import { getQualityFloors } from "../lib/product-economics";
+import { getMonthlyPace } from "../lib/monthly-pace";
 
 type ProductStage = "launch" | "evergreen" | "escalavel" | "nicho";
 
@@ -102,6 +103,20 @@ function getFrequencyLimit(
     : cfg.frequencyLimitProspection;
 }
 
+// Item 4 — limite de variancia do CPA. Adset com CPA volatil (R$30, R$120,
+// R$10, R$80) tem mesma media que estavel (R$50, R$48, R$52, R$49) mas escala
+// mal — sinal de tracking quebrado, criativo polarizante ou audiencia errada.
+// Coeficiente de variacao (CV = stddev/mean) > MAX_CPA_CV bloqueia scale.
+const MAX_CPA_CV = 0.4;
+
+function stdDev(values: number[]): number {
+  if (values.length < 2) return 0;
+  const mean = values.reduce((s, v) => s + v, 0) / values.length;
+  const variance =
+    values.reduce((s, v) => s + (v - mean) ** 2, 0) / values.length;
+  return Math.sqrt(variance);
+}
+
 function evaluateScaleQuality(
   campaignName: string,
   dailyWindow: AdsetDaily[],
@@ -112,6 +127,7 @@ function evaluateScaleQuality(
   avgFrequency: number;
   avgHookRate: number | null;
   avgOutboundCtr: number | null;
+  cpaCV: number | null;
   blockers: string[];
 } {
   const frequencyLimit = getFrequencyLimit(campaignName, cfg);
@@ -122,6 +138,21 @@ function evaluateScaleQuality(
   const avgHookRate = averageMetric(dailyWindow.map(day => day.hookRate));
   const avgOutboundCtr = averageMetric(dailyWindow.map(day => day.outboundCtr));
   const blockers: string[] = [];
+
+  // Item 4 — CV do CPA. So calcula em dias com CPA valido (sales > 0).
+  const cpas = dailyWindow.map(d => d.cpa).filter(c => c > 0);
+  let cpaCV: number | null = null;
+  if (cpas.length >= 2) {
+    const mean = cpas.reduce((s, v) => s + v, 0) / cpas.length;
+    if (mean > 0) {
+      cpaCV = Math.round((stdDev(cpas) / mean) * 100) / 100;
+      if (cpaCV > MAX_CPA_CV) {
+        blockers.push(
+          `CPA volátil (CV=${cpaCV.toFixed(2)} > ${MAX_CPA_CV}) — tracking ruim, audiência errada ou criativo polarizante`
+        );
+      }
+    }
+  }
 
   if (avgFrequency > frequencyLimit * 0.85) {
     blockers.push(
@@ -147,6 +178,7 @@ function evaluateScaleQuality(
     avgFrequency,
     avgHookRate,
     avgOutboundCtr,
+    cpaCV,
     blockers,
   };
 }
@@ -361,6 +393,19 @@ export async function executeAutomationsForProduct(productId: string): Promise<v
     console.log(`[auto:${product.slug}] nenhum adset ativo`);
     return;
   }
+
+  // Item 2 — pacing mensal ajusta autoScaleCPAThreshold dinamicamente.
+  // Sobral: "se a 8d do fim com 60% da meta, escala mais cedo aceitando CPA
+  // um pouco maior. Se ja bateu meta, aperta pra preservar margem."
+  const pace = await getMonthlyPace(productId);
+  const adjustedScaleCPA = cfg.autoScaleCPAThreshold * pace.scaleThresholdAdjust;
+  if (pace.scaleThresholdAdjust !== 1.0) {
+    console.log(
+      `[auto:${product.slug}] pacing ${pace.status} (ratio ${pace.paceRatio}), scale threshold ajustado: ${cfg.autoScaleCPAThreshold} → ${adjustedScaleCPA.toFixed(2)} (×${pace.scaleThresholdAdjust})`
+    );
+  }
+  // cfg eh imutavel pelo Prisma; criamos um override mutavel pra usar abaixo.
+  const adjustedCfg = { ...cfg, autoScaleCPAThreshold: adjustedScaleCPA };
 
   // R1 — teto diário do produto. M8: pause ratcheted em vez de mass-pause
   // direto. Se o gasto excede o teto em <10%, pausa apenas top 50% adsets
@@ -701,13 +746,13 @@ export async function executeAutomationsForProduct(productId: string): Promise<v
       }
     }
 
-    // R7 — auto-scale winners
+    // R7 — auto-scale winners (usa adjustedCfg.autoScaleCPAThreshold ajustado por pacing)
     if (cfg.autoScaleWinners) {
       const lastN = s.daily.slice(-cfg.autoScaleMinDays);
       const allBelowThreshold =
         lastN.length >= cfg.autoScaleMinDays &&
-        lastN.every(d => d.sales > 0 && d.cpa > 0 && d.cpa < cfg.autoScaleCPAThreshold);
-      const qualityGate = evaluateScaleQuality(s.campaignName, lastN, cfg, product.stage as ProductStage);
+        lastN.every(d => d.sales > 0 && d.cpa > 0 && d.cpa < adjustedCfg.autoScaleCPAThreshold);
+      const qualityGate = evaluateScaleQuality(s.campaignName, lastN, adjustedCfg, product.stage as ProductStage);
       if (allBelowThreshold && qualityGate.allowed && s.dailyBudget < cfg.autoScaleMaxBudget) {
         // Cooldown 72h: regra de mercado "+20% no máximo a cada 3 dias".
         // O AutomationLock do auto_executor expira em 4h (rotina de pause/scale geral),
@@ -788,6 +833,96 @@ export async function executeAutomationsForProduct(productId: string): Promise<v
               },
               productId
             );
+          }
+        }
+      }
+    }
+
+    // R8 — scale-down (desescalar antes de pausar). Item 3 do roadmap Sobral.
+    // Detecta CPA com slope positivo nos ultimos 5d (CPA subindo) MAS ainda
+    // abaixo de breakeven (R6 nao disparou). Reduz budget 15% pra preservar
+    // margem antes do adset quebrar. Mais cirurgico que pause direto.
+    // Cooldown 48h pra nao desescalar 2x na mesma semana.
+    {
+      const SCALE_DOWN_WINDOW = 5;
+      const MIN_SLOPE_PCT_PER_DAY = 5; // CPA subindo >=5%/dia
+      const SCALE_DOWN_PERCENT = 15;
+      const SCALE_DOWN_COOLDOWN_MS = 48 * 60 * 60 * 1000;
+      const MIN_BUDGET_FLOOR = 20; // nao desescala abaixo de R$20
+
+      const lastN = s.daily.slice(-SCALE_DOWN_WINDOW);
+      const validDays = lastN.filter(d => d.sales > 0 && d.cpa > 0);
+      if (
+        validDays.length >= 3 &&
+        s.dailyBudget * (1 - SCALE_DOWN_PERCENT / 100) >= MIN_BUDGET_FLOOR
+      ) {
+        // Slope linear simples: (last - first) / first em pct/dia.
+        const first = validDays[0].cpa;
+        const last = validDays[validDays.length - 1].cpa;
+        const days = validDays.length - 1;
+        const slopePctPerDay =
+          first > 0 && days > 0 ? ((last - first) / first / days) * 100 : 0;
+        const cpaUnderBreakeven = last < cfg.breakevenCPA;
+
+        if (slopePctPerDay >= MIN_SLOPE_PCT_PER_DAY && cpaUnderBreakeven) {
+          const lastDownscale = await prisma.actionLog.findFirst({
+            where: {
+              productId,
+              action: "auto_scale_down",
+              entityType: "adset",
+              entityId: s.adsetId,
+              executedAt: { gt: new Date(Date.now() - SCALE_DOWN_COOLDOWN_MS) },
+            },
+            orderBy: { executedAt: "desc" },
+          });
+          if (!lastDownscale) {
+            const lock = await canAutomate(productId, "adset", s.adsetId, "auto_executor");
+            if (lock.allowed) {
+              const newBudget = Math.max(
+                MIN_BUDGET_FLOOR,
+                Math.round(s.dailyBudget * (1 - SCALE_DOWN_PERCENT / 100))
+              );
+              if (await updateAdsetBudget(s.adsetId, newBudget)) {
+                await acquireLock(
+                  productId,
+                  "adset",
+                  s.adsetId,
+                  "auto_executor",
+                  "scale_down",
+                  String(s.dailyBudget),
+                  String(newBudget)
+                );
+                await logAction({
+                  productId,
+                  action: "auto_scale_down",
+                  entityType: "adset",
+                  entityId: s.adsetId,
+                  entityName: s.adsetName,
+                  details: `CPA subindo ${slopePctPerDay.toFixed(1)}%/d (${first.toFixed(0)}→${last.toFixed(0)}). Budget R$${s.dailyBudget} → R$${newBudget}`,
+                  reasoning: `Adset ainda lucra (CPA R$${last.toFixed(0)} < breakeven R$${cfg.breakevenCPA.toFixed(0)}) mas tendencia ruim: CPA subiu ${slopePctPerDay.toFixed(1)}%/dia em ${validDays.length} dias. Reduzir budget ${SCALE_DOWN_PERCENT}% agora preserva margem e da chance pro algoritmo otimizar — mais cirurgico que pausar de pancada quando bater R6.`,
+                  inputSnapshot: {
+                    slopePctPerDay,
+                    daysAnalyzed: validDays.length,
+                    cpaFirst: first,
+                    cpaLast: last,
+                    breakevenCPA: cfg.breakevenCPA,
+                    budgetBefore: s.dailyBudget,
+                    budgetAfter: newBudget,
+                  },
+                });
+                if (cfg.notifyOnAutoAction) {
+                  await sendNotification(
+                    "auto_action",
+                    {
+                      action: `REDUZIDO 15% (${product.slug})`,
+                      adset: s.adsetName,
+                      reason: `CPA subindo ${slopePctPerDay.toFixed(1)}%/d antes de quebrar`,
+                    },
+                    productId
+                  );
+                }
+              }
+            }
           }
         }
       }

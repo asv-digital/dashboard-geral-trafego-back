@@ -16,8 +16,10 @@ import {
   getTimeseries,
   getBriefing,
   getGlobalOverview,
+  getAwarenessMismatches,
   type TimeseriesMetric,
 } from "../services/analytics";
+import { getMonthlyPace } from "../lib/monthly-pace";
 import { classifyAwarenessForProduct } from "../services/awareness-classifier";
 
 const router = Router();
@@ -112,6 +114,18 @@ router.get("/briefing/:productId", async (req: Request, res: Response) => {
 router.get("/global-overview", async (req: Request, res: Response) => {
   const days = parseDays(req.query.days, 7, 90);
   const result = await getGlobalOverview(days);
+  res.json(result);
+});
+
+// Onda Roadmap Sobral
+router.get("/monthly-pace/:productId", async (req: Request, res: Response) => {
+  const result = await getMonthlyPace(String(req.params.productId));
+  res.json(result);
+});
+
+router.get("/awareness-mismatches/:productId", async (req: Request, res: Response) => {
+  const days = parseDays(req.query.days, 30, 90);
+  const result = await getAwarenessMismatches(String(req.params.productId), days);
   res.json(result);
 });
 

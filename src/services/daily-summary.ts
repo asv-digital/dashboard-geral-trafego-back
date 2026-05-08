@@ -6,6 +6,7 @@ import prisma from "../prisma";
 import { addBRTDays, nextHourBRT, startOfBRTDay } from "../lib/tz";
 import { sendNotification } from "./whatsapp-notifier";
 import { runSystemHealthChecks } from "./system-alerts";
+import { getMonthlyPace } from "../lib/monthly-pace";
 
 const SUMMARY_HOUR_BRT = 8;
 
@@ -25,6 +26,8 @@ interface ProductSummary {
   topAdsets: string[];     // ate 3 linhas: "Adset XYZ — 4 vendas / R$45 CPA"
   topCreatives: string[];  // ate 3 linhas: "Creative ABC — hook 38% / CTR 2.1%"
   topObjection: string | null; // "preco (12 menc)" se houver
+  // Item 2 roadmap Sobral — pacing mensal
+  paceLine: string | null;
 }
 
 function pct(now: number, baseline: number): string | null {
@@ -41,7 +44,7 @@ async function buildProductSummary(productId: string): Promise<ProductSummary> {
     return {
       name: "(?)", spend: "0", sales: 0, cpa: "—", roas: "—", alerts: 0,
       deltaSpend: null, deltaSales: null, deltaCpa: null,
-      topAdsets: [], topCreatives: [], topObjection: null,
+      topAdsets: [], topCreatives: [], topObjection: null, paceLine: null,
     };
   }
 
@@ -146,6 +149,21 @@ async function buildProductSummary(productId: string): Promise<ProductSummary> {
     where: { productId, lastState: "active" },
   });
 
+  // Item 2 — pacing mensal. Sobral: "estamos a 8d do fim, 60% da meta —
+  // preciso de 4.5 vendas/dia". Sem MonthlyGoal: paceLine = null.
+  const pace = await getMonthlyPace(productId);
+  let paceLine: string | null = null;
+  if (pace.status !== "no_goal" && pace.targetSales !== null) {
+    const statusEmoji = {
+      ahead: "🟢",
+      on_track: "🔵",
+      behind: "🟡",
+      critical: "🔴",
+      no_goal: "",
+    }[pace.status];
+    paceLine = `${statusEmoji} ${pace.currentSales}/${pace.targetSales} vendas (D${pace.dayOfMonth}/${pace.daysInMonth}, pace ${pace.paceRatio !== null ? Math.round(pace.paceRatio * 100) : "—"}%${pace.requiredDailySales !== null ? `, precisa ${pace.requiredDailySales}/dia` : ""})`;
+  }
+
   return {
     name: product.name,
     spend: spend.toFixed(2),
@@ -159,6 +177,7 @@ async function buildProductSummary(productId: string): Promise<ProductSummary> {
     topAdsets,
     topCreatives,
     topObjection,
+    paceLine,
   };
 }
 
@@ -188,6 +207,7 @@ async function sendDailySummaries(): Promise<void> {
           topAdsets: summary.topAdsets,
           topCreatives: summary.topCreatives,
           topObjection: summary.topObjection,
+          paceLine: summary.paceLine,
         },
         p.id
       );

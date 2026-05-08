@@ -53,6 +53,10 @@ function formatMessage(type: NotificationType, data: NotificationPayload): strin
       lines.push(`🛒 Vendas: ${data.sales}${fmtDelta(data.deltaSales)}`);
       lines.push(`📍 CPA: R$${data.cpa}${fmtDelta(data.deltaCpa)}`);
       lines.push(`📈 ROAS: ${data.roas}`);
+      if (data.paceLine) {
+        lines.push("");
+        lines.push(`🎯 Meta mensal: ${data.paceLine}`);
+      }
       if (Array.isArray(data.topAdsets) && data.topAdsets.length > 0) {
         lines.push("");
         lines.push("🎯 *Top adsets:*");
