@@ -123,6 +123,7 @@ model Product {
   assets              ProductAsset[]
   cartAbandonments    CartAbandonment[]
   checkoutPreps       CheckoutPrep[]
+  highTicketSales     HighTicketSale[]
   dailySnapshots      DailySnapshot[]
   placementMetrics    PlacementMetric[]
   actionLogs          ActionLog[]
@@ -410,6 +411,8 @@ model Sale {
   capiSent    Boolean  @default(false)
   capiSentAt  DateTime?
   capiEventId String?
+
+  highTicketUpsells HighTicketSale[]
   // D1 — observability: { eventsReceived, fbtraceId, diagnostics } | { error }.
   // Permite detectar drop silencioso (events_received=0 com http 200).
   capiResponse Json?
@@ -434,6 +437,33 @@ model Sale {
   campaign Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
 
   @@index([productId, date, status])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// HIGH TICKET SALE — vendas de high ticket (mentoria/upsell) registradas
+// MANUALMENTE pelo gestor depois da live semanal, separado do fluxo de
+// trafego. Nao influencia decisoes automaticas do agente — vive em painel
+// separado. Sincroniza com Sale low correspondente via match por email
+// (matchedSaleId opcional).
+// ═══════════════════════════════════════════════════════════════
+
+model HighTicketSale {
+  id            String    @id @default(cuid())
+  productId     String
+  customerEmail String
+  amountGross   Float
+  saleDate      DateTime
+  notes         String?
+  matchedSaleId String?   // Sale low correspondente (matched por email)
+  syncedAt      DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  product     Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  matchedSale Sale?   @relation(fields: [matchedSaleId], references: [id], onDelete: SetNull)
+
+  @@index([productId, saleDate])
+  @@index([customerEmail])
 }
 
 // ═══════════════════════════════════════════════════════════════

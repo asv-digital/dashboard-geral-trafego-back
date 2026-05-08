@@ -3,6 +3,7 @@ import { z } from "zod";
 import prisma from "../prisma";
 import { requireAuth, requireRole } from "../auth/middleware";
 import { computeNetPerSale, deriveThresholds } from "../lib/product-economics";
+import { executeEmergencyStop } from "../services/emergency-stop";
 
 const router = Router();
 
@@ -245,5 +246,24 @@ router.delete("/:id", requireRole("owner", "editor"), async (req: Request, res: 
     res.status(404).json({ error: "not_found" });
   }
 });
+
+// POST /:id/emergency-stop — Freio de Mão.
+// Liga supervisedMode + pausa todas campanhas whitelisted no Meta + log + WhatsApp.
+router.post(
+  "/:id/emergency-stop",
+  requireRole("owner", "editor"),
+  async (req: Request, res: Response) => {
+    try {
+      const result = await executeEmergencyStop(
+        String(req.params.id),
+        req.user?.email
+      );
+      res.json(result);
+    } catch (err) {
+      console.error(`[products] emergency-stop falhou:`, err);
+      res.status(500).json({ error: "internal", message: (err as Error).message });
+    }
+  }
+);
 
 export default router;
