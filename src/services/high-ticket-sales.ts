@@ -57,7 +57,23 @@ export async function createHighTicketSale(
 }
 
 export async function deleteHighTicketSale(id: string) {
-  return prisma.highTicketSale.delete({ where: { id } });
+  // Se estava matched, reverte convertedToMentoria na Sale low pra não enviesar
+  // waterfall/LTV/payback após exclusão do high.
+  const high = await prisma.highTicketSale.findUnique({
+    where: { id },
+    select: { matchedSaleId: true },
+  });
+  if (high?.matchedSaleId) {
+    await prisma.$transaction([
+      prisma.highTicketSale.delete({ where: { id } }),
+      prisma.sale.update({
+        where: { id: high.matchedSaleId },
+        data: { convertedToMentoria: false },
+      }),
+    ]);
+    return;
+  }
+  await prisma.highTicketSale.delete({ where: { id } });
 }
 
 /**
@@ -85,10 +101,18 @@ export async function syncHighTicketSales(productId: string): Promise<{
       orderBy: { date: "desc" },
     });
     if (lowSale) {
-      await prisma.highTicketSale.update({
-        where: { id: h.id },
-        data: { matchedSaleId: lowSale.id, syncedAt: new Date() },
-      });
+      // Atomic: marca high como matched + low como convertedToMentoria.
+      // O flag na Sale é o que alimenta waterfall/LTV/payback (analytics.ts).
+      await prisma.$transaction([
+        prisma.highTicketSale.update({
+          where: { id: h.id },
+          data: { matchedSaleId: lowSale.id, syncedAt: new Date() },
+        }),
+        prisma.sale.update({
+          where: { id: lowSale.id },
+          data: { convertedToMentoria: true },
+        }),
+      ]);
       matched += 1;
     }
   }

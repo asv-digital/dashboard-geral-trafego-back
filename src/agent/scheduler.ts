@@ -9,6 +9,7 @@
 //   7. creative-stock
 //   8. comment-analyzer (LLM)
 //   9. audience-builder (lookalikes em milestones)
+//   10. awareness-classifier (LLM, alimenta Schwartz mismatch)
 //
 // Tudo por produto. Falha em um não derruba os outros.
 
@@ -23,6 +24,7 @@ import { resolveActiveTestsAll } from "../services/ab-test-resolver";
 import { checkCreativeStockAll } from "../services/creative-stock";
 import { analyzeCommentsAll } from "../services/comment-analyzer";
 import { checkLookalikeAll } from "../services/audience-builder";
+import { classifyAwarenessAll } from "../services/awareness-classifier";
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(value || "", 10);
@@ -117,6 +119,14 @@ async function runPipeline(): Promise<ProductCollectionResult[]> {
       await checkLookalikeAll();
     } catch (err) {
       console.error(`[scheduler] audience-builder falhou: ${(err as Error).message}`);
+    }
+
+    // 10. awareness classifier (LLM) — taga ProductAsset.awarenessStage pra
+    // alimentar Schwartz mismatch (pulse, getDecisionQueue, getAwarenessMismatches).
+    try {
+      await classifyAwarenessAll();
+    } catch (err) {
+      console.error(`[scheduler] awareness-classifier falhou: ${(err as Error).message}`);
     }
 
     lastRunAt = new Date().toISOString();

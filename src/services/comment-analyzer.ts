@@ -77,7 +77,15 @@ async function fetchAdComments(adId: string): Promise<RawComment[]> {
 
     while (url) {
       const res = await throttledGraphFetch(url);
-      if (!res.ok) return comments;
+      if (!res.ok) {
+        // 401/403/190: token sem `pages_read_engagement` ou ad deletado/oculto.
+        // Antes engolíamos silencioso — agora logamos pra detectar capability gap.
+        const bodyTxt = await res.text().catch(() => "");
+        console.warn(
+          `[comment-analyzer] fetchAdComments adId=${adId} status=${res.status} body=${bodyTxt.slice(0, 200)}`,
+        );
+        return comments;
+      }
       const json = (await res.json()) as {
         data?: RawComment[];
         paging?: { next?: string };
@@ -87,7 +95,10 @@ async function fetchAdComments(adId: string): Promise<RawComment[]> {
     }
 
     return comments;
-  } catch {
+  } catch (err) {
+    console.warn(
+      `[comment-analyzer] fetchAdComments adId=${adId} threw: ${(err as Error).message}`,
+    );
     return [];
   }
 }
@@ -112,7 +123,10 @@ async function getTrackedAds(
   try {
     const ads = await getTrackedAdsForCampaigns(accountId, trackedIds);
     return ads.map(ad => ({ id: ad.id, name: ad.name }));
-  } catch {
+  } catch (err) {
+    console.warn(
+      `[comment-analyzer] getTrackedAds productId=${product.id} threw: ${(err as Error).message}`,
+    );
     return [];
   }
 }

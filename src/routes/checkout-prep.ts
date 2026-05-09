@@ -45,8 +45,14 @@ router.post("/", async (req: Request, res: Response) => {
     ? await prisma.product.findUnique({ where: { id: productId } })
     : await prisma.product.findUnique({ where: { slug: productSlug } });
   if (!product || product.status !== "active") {
-    // Nao revela se produto existe — apenas accept silencioso pra evitar enum.
-    res.json({ ok: true });
+    // Não revela se produto existe (anti-enum), mas o JS da landing precisa
+    // saber que o prep não foi capturado pra logar/alertar/decidir fallback.
+    // captured=false é sinal pro front; reason é genérico pra não diferenciar
+    // produto-não-existe de produto-pausado externamente.
+    console.warn(
+      `[checkout-prep] silent_drop slug=${productSlug || "?"} id=${productId || "?"} ip=${clientIp}`,
+    );
+    res.json({ ok: true, captured: false, reason: "product_unavailable" });
     return;
   }
 
@@ -78,7 +84,7 @@ router.post("/", async (req: Request, res: Response) => {
         expiresAt: new Date(Date.now() + PREP_TTL_MS),
       },
     });
-    res.json({ ok: true });
+    res.json({ ok: true, captured: true });
   } catch (err) {
     console.error(`[checkout-prep] erro: ${err instanceof Error ? err.message : String(err)}`);
     res.status(500).json({ error: "internal" });

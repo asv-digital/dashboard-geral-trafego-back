@@ -356,8 +356,10 @@ async function saveAdDiagnostics(
         },
       });
       saved++;
-    } catch {
-      // skip
+    } catch (err) {
+      console.warn(
+        `  [!] saveAdDiagnostics adId=${row.ad_id} date=${row.date_start} falhou: ${(err as Error).message}`,
+      );
     }
   }
   if (saved > 0) console.log(`  [+] ${saved} ad diagnostics salvos`);
@@ -470,8 +472,12 @@ async function savePlacementMetrics(
           cpa,
         },
       });
-    } catch {
-      // skip — placement metrics são append-only sem unique constraint
+    } catch (err) {
+      // append-only sem unique constraint, então duplicidade não dispara —
+      // qualquer erro aqui é DB real (timeout, schema mismatch, FK).
+      console.warn(
+        `  [!] savePlacementMetric campaignId=${r.campaign_id} platform=${r.publisher_platform} falhou: ${(err as Error).message}`,
+      );
     }
   }
 }

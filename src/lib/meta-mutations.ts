@@ -148,7 +148,13 @@ export async function getActiveAdsetsForCampaigns(
 
     while (nextUrl) {
       const res = await fetch(nextUrl);
-      if (!res.ok) return adsets;
+      if (!res.ok) {
+        const bodyTxt = await res.text().catch(() => "");
+        console.warn(
+          `[meta-mutations] getActiveAdsetsForCampaigns acct=${accountId} status=${res.status} body=${bodyTxt.slice(0, 200)}`,
+        );
+        return adsets;
+      }
       const json = (await res.json()) as MetaPagingResponse<Record<string, string>>;
       adsets.push(
         ...((json.data ?? []) as any[]).map(a => ({
@@ -163,7 +169,10 @@ export async function getActiveAdsetsForCampaigns(
     }
 
     return adsets;
-  } catch {
+  } catch (err) {
+    console.warn(
+      `[meta-mutations] getActiveAdsetsForCampaigns acct=${accountId} threw: ${(err as Error).message}`,
+    );
     return [];
   }
 }
@@ -191,7 +200,13 @@ export async function getTrackedAdsForCampaigns(
 
     while (nextUrl) {
       const res = await fetch(nextUrl);
-      if (!res.ok) return ads;
+      if (!res.ok) {
+        const bodyTxt = await res.text().catch(() => "");
+        console.warn(
+          `[meta-mutations] getTrackedAdsForCampaigns acct=${accountId} status=${res.status} body=${bodyTxt.slice(0, 200)}`,
+        );
+        return ads;
+      }
       const json = (await res.json()) as MetaPagingResponse<Record<string, string>>;
       ads.push(
         ...((json.data ?? []) as any[]).map(ad => ({
@@ -206,7 +221,10 @@ export async function getTrackedAdsForCampaigns(
     }
 
     return ads;
-  } catch {
+  } catch (err) {
+    console.warn(
+      `[meta-mutations] getTrackedAdsForCampaigns acct=${accountId} threw: ${(err as Error).message}`,
+    );
     return [];
   }
 }
