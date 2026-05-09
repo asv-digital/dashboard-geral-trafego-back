@@ -205,7 +205,7 @@ router.post(
     } catch (err) {
       const code = err instanceof Error ? err.message : "internal";
       const status =
-        code === "anthropic_not_configured"
+        code === "llm_not_configured" || code === "anthropic_not_configured"
           ? 412
           : code === "asset_not_found"
             ? 404

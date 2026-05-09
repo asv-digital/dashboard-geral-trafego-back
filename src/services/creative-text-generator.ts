@@ -9,13 +9,11 @@
 
 import { promises as fs } from "fs";
 import path from "path";
-import Anthropic from "@anthropic-ai/sdk";
 import prisma from "../prisma";
-import { getResolvedGlobalSettings } from "../lib/runtime-config";
+import { complete, completeWithImage, isLLMConfigured } from "../lib/llm";
 import { resolveStoredFilePath } from "../lib/storage";
 
-const MAX_IMAGE_BYTES = 4 * 1024 * 1024; // 4MB — limite seguro pra Claude vision
-const DEFAULT_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024; // 4MB — limite seguro pra vision
 
 export interface GeneratedCreativeText {
   copy: string;
@@ -161,9 +159,8 @@ export async function generateTextForAsset(
   productId: string,
   assetId: string,
 ): Promise<GeneratedCreativeText> {
-  const { anthropicApiKey } = await getResolvedGlobalSettings();
-  if (!anthropicApiKey) {
-    throw new Error("anthropic_not_configured");
+  if (!(await isLLMConfigured())) {
+    throw new Error("llm_not_configured");
   }
 
   const asset = await prisma.productAsset.findUnique({ where: { id: assetId } });
@@ -177,48 +174,37 @@ export async function generateTextForAsset(
   const product = await buildProductContext(productId);
   const userText = buildUserText(product, { type: asset.type, name: asset.name });
 
-  const client = new Anthropic({ apiKey: anthropicApiKey });
-
-  const userContent: Anthropic.Messages.ContentBlockParam[] = [];
-
-  // Vision so para imagem
+  let text: string;
   if (asset.type === "image") {
     const img = await readImageBytes(asset);
     if (img) {
-      userContent.push({
-        type: "image",
-        source: {
-          type: "base64",
-          media_type: img.mimeType as "image/jpeg" | "image/png" | "image/webp" | "image/gif",
-          data: img.bytes.toString("base64"),
+      text = await completeWithImage({
+        system: SYSTEM_PROMPT,
+        user: userText,
+        maxTokens: 700,
+        temperature: 0.5,
+        image: {
+          base64: img.bytes.toString("base64"),
+          mimeType: img.mimeType as "image/jpeg" | "image/png" | "image/webp" | "image/gif",
         },
       });
     } else {
       console.warn(`[text-gen] sem visual para asset ${assetId}, fallback metadata-only`);
+      text = await complete({
+        system: SYSTEM_PROMPT,
+        user: userText,
+        maxTokens: 700,
+        temperature: 0.5,
+      });
     }
+  } else {
+    text = await complete({
+      system: SYSTEM_PROMPT,
+      user: userText,
+      maxTokens: 700,
+      temperature: 0.5,
+    });
   }
-
-  userContent.push({ type: "text", text: userText });
-
-  const res = await client.messages.create({
-    model: DEFAULT_MODEL,
-    max_tokens: 700,
-    temperature: 0.5,
-    system: [
-      {
-        type: "text",
-        text: SYSTEM_PROMPT,
-        cache_control: { type: "ephemeral" },
-      },
-    ],
-    messages: [{ role: "user", content: userContent }],
-  });
-
-  const text = res.content
-    .filter(b => b.type === "text")
-    .map(b => (b as { type: "text"; text: string }).text)
-    .join("\n");
-
   const parsed = parseJsonResponse(text);
 
   await prisma.productAsset.update({
