@@ -101,4 +101,39 @@ router.get("/db-stats", async (_req: Request, res: Response) => {
   res.json({ products, campaigns, creatives, sales, actions, assets });
 });
 
+// POST /admin/monthly-goal — upsert direto (eu uso via curl pra cadastrar
+// metas sem precisar de cookie de sessao). Mesmo schema da rota normal.
+router.post("/monthly-goal", async (req: Request, res: Response) => {
+  const prisma = (await import("../prisma")).default;
+  const { productId, month, targetSales, targetCpa, targetRoas, targetProfit } = req.body || {};
+  if (!productId || !month || typeof targetSales !== "number") {
+    res.status(400).json({ error: "missing_required", required: ["productId", "month", "targetSales"] });
+    return;
+  }
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
+    res.status(400).json({ error: "invalid_month", hint: "YYYY-MM" });
+    return;
+  }
+  try {
+    const goal = await prisma.monthlyGoal.upsert({
+      where: { productId_month: { productId, month } },
+      create: { productId, month, targetSales, targetCpa, targetRoas, targetProfit },
+      update: { targetSales, targetCpa, targetRoas, targetProfit },
+    });
+    res.status(201).json({ goal });
+  } catch (err) {
+    res.status(500).json({ error: "internal", message: (err as Error).message });
+  }
+});
+
+// GET /admin/products — lista basica pra eu pegar productId quando precisar
+router.get("/products", async (_req: Request, res: Response) => {
+  const prisma = (await import("../prisma")).default;
+  const products = await prisma.product.findMany({
+    select: { id: true, slug: true, name: true, status: true, stage: true, kirvanoProductId: true, supervisedMode: true },
+    orderBy: { createdAt: "desc" },
+  });
+  res.json({ products });
+});
+
 export default router;
