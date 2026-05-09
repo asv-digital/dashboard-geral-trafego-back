@@ -22,9 +22,9 @@ async function createLookalikeAudience(
   sourceAudienceId: string,
   name: string,
   percentage: number
-): Promise<{ id: string } | null> {
+): Promise<{ id: string } | { error: string }> {
   const { accessToken: token } = await getResolvedProductMetaSettings();
-  if (!token) return null;
+  if (!token) return { error: "no_meta_token" };
 
   try {
     const body = new URLSearchParams();
@@ -49,12 +49,13 @@ async function createLookalikeAudience(
     const json = (await res.json()) as any;
     if (json.error) {
       console.error(`[audience-builder] erro: ${json.error.message}`);
-      return null;
+      return { error: json.error.message || "meta_error" };
     }
     return { id: json.id };
   } catch (err) {
-    console.error("[audience-builder] fetch falhou:", err);
-    return null;
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[audience-builder] fetch falhou: ${msg}`);
+    return { error: msg };
   }
 }
 
@@ -104,7 +105,31 @@ export async function checkLookalikeForProduct(productId: string): Promise<void>
       name,
       pct
     );
-    if (!result) continue;
+
+    if ("error" in result) {
+      // Persistir tentativa falhada com status="error" pra não retentar
+      // sozinho a cada ciclo (e ficar martelando Meta com erro). Gestor
+      // resolve manualmente (token, scope, audience source size mínimo).
+      await prisma.lookalikeAudience.create({
+        data: {
+          productId,
+          name,
+          metaAudienceId: `error_${Date.now()}_${pct}`,
+          sourceAudienceId,
+          percentage: pct,
+          buyerCountAtCreation: milestone,
+          status: "error",
+        },
+      });
+      await logAction({
+        productId,
+        action: "lookalike_failed",
+        entityType: "audience",
+        entityName: name,
+        details: `milestone=${milestone} pct=${pct}% err=${result.error}`,
+      });
+      continue;
+    }
 
     await prisma.lookalikeAudience.create({
       data: {

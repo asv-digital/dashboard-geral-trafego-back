@@ -203,9 +203,12 @@ router.patch("/settings/global", async (req: Request, res: Response) => {
       create: { id: "singleton", ...data },
       update: data,
     });
-    // Invalida cache
+    // Invalida cache de runtime config E status da conta — sem o segundo,
+    // status do Meta ad account ficava preso 60s mesmo após troca de token.
     const { clearRuntimeConfigCache } = await import("../lib/runtime-config");
     clearRuntimeConfigCache("global");
+    const { clearAccountStatusCache } = await import("../lib/meta-account");
+    clearAccountStatusCache();
     res.json({ settings });
   } catch (err) {
     res.status(500).json({ error: "internal", message: (err as Error).message });

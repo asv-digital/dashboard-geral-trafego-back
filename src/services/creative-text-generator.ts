@@ -19,6 +19,8 @@ export interface GeneratedCreativeText {
   copy: string;
   headline: string;
   hook: string;
+  source?: "vision" | "metadata_only";
+  fallbackReason?: string;
 }
 
 const SYSTEM_PROMPT = `Voce e Pedro Sobral, gestor de trafego senior em PT-BR. Escreve copy de anuncio Meta (Facebook/Instagram) curto, denso e direto.
@@ -175,6 +177,9 @@ export async function generateTextForAsset(
   const userText = buildUserText(product, { type: asset.type, name: asset.name });
 
   let text: string;
+  let source: "vision" | "metadata_only" = "metadata_only";
+  let fallbackReason: string | undefined;
+
   if (asset.type === "image") {
     const img = await readImageBytes(asset);
     if (img) {
@@ -188,7 +193,11 @@ export async function generateTextForAsset(
           mimeType: img.mimeType as "image/jpeg" | "image/png" | "image/webp" | "image/gif",
         },
       });
+      source = "vision";
     } else {
+      // Imagem >4MB ou fetch falhou. Cai pra metadata-only e expõe ao caller
+      // pra UI poder mostrar "fallback texto-only — imagem grande/inacessível".
+      fallbackReason = "image_unavailable_or_too_large";
       console.warn(`[text-gen] sem visual para asset ${assetId}, fallback metadata-only`);
       text = await complete({
         system: SYSTEM_PROMPT,
@@ -198,6 +207,8 @@ export async function generateTextForAsset(
       });
     }
   } else {
+    // Vídeo: vision não suporta direto. metadata-only é o caminho esperado.
+    fallbackReason = "video_no_vision_support";
     text = await complete({
       system: SYSTEM_PROMPT,
       user: userText,
@@ -206,6 +217,11 @@ export async function generateTextForAsset(
     });
   }
   const parsed = parseJsonResponse(text);
+  const enriched: GeneratedCreativeText = {
+    ...parsed,
+    source,
+    ...(fallbackReason ? { fallbackReason } : {}),
+  };
 
   await prisma.productAsset.update({
     where: { id: assetId },
@@ -217,7 +233,7 @@ export async function generateTextForAsset(
     },
   });
 
-  return parsed;
+  return enriched;
 }
 
 export async function updateAssetText(

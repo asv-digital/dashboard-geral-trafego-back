@@ -10,6 +10,7 @@
 //   8. comment-analyzer (LLM)
 //   9. audience-builder (lookalikes em milestones)
 //   10. awareness-classifier (LLM, alimenta Schwartz mismatch)
+//   11. outcome-resolver (preenche ActionLog.outcome 24h pós-pause/scale)
 //
 // Tudo por produto. Falha em um não derruba os outros.
 
@@ -25,6 +26,7 @@ import { checkCreativeStockAll } from "../services/creative-stock";
 import { analyzeCommentsAll } from "../services/comment-analyzer";
 import { checkLookalikeAll } from "../services/audience-builder";
 import { classifyAwarenessAll } from "../services/awareness-classifier";
+import { resolvePendingOutcomes } from "../services/outcome-resolver";
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(value || "", 10);
@@ -127,6 +129,14 @@ async function runPipeline(): Promise<ProductCollectionResult[]> {
       await classifyAwarenessAll();
     } catch (err) {
       console.error(`[scheduler] awareness-classifier falhou: ${(err as Error).message}`);
+    }
+
+    // 11. outcome resolver — preenche ActionLog.outcome 24h após pause/scale.
+    // Sem isso, trading journal só tinha reasoning sem efeito medido.
+    try {
+      await resolvePendingOutcomes();
+    } catch (err) {
+      console.error(`[scheduler] outcome-resolver falhou: ${(err as Error).message}`);
     }
 
     lastRunAt = new Date().toISOString();

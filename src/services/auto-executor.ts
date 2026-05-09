@@ -38,7 +38,8 @@ type ProductStage = "launch" | "evergreen" | "escalavel" | "nicho";
 interface AdsetDaily {
   date: Date;
   spend: number;
-  sales: number;
+  sales: number;        // Kirvano-attributed (autoritativo)
+  salesPixel: number;   // Meta-attributed (pra detectar attribution gap em R5)
   cpa: number;
   revenue: number;
   frequency: number;
@@ -238,6 +239,7 @@ async function getAdsetSnapshot(productId: string): Promise<AdsetSnapshot[]> {
         date: m.date,
         spend: 0,
         sales: 0,
+        salesPixel: 0,
         cpa: 0,
         revenue: 0,
         frequency: 0,
@@ -256,6 +258,7 @@ async function getAdsetSnapshot(productId: string): Promise<AdsetSnapshot[]> {
       // decisao com venda atribuida errado (UTM falha, dedup duplicado).
       // m.sales fica disponivel via prisma direto pra dashboard/display.
       existing.sales += m.salesKirvano;
+      existing.salesPixel += m.salesPixel ?? 0;
       existing.revenue += m.salesKirvano * product.netPerSale;
       const mFreq = m.frequency || 0;
       if (mFreq > 0 && m.impressions > 0) {
@@ -278,6 +281,7 @@ async function getAdsetSnapshot(productId: string): Promise<AdsetSnapshot[]> {
         date: day.date,
         spend: day.spend,
         sales: day.sales,
+        salesPixel: day.salesPixel,
         cpa: day.cpa,
         revenue: day.revenue,
         frequency: day.freqWeightTotal > 0 ? day.freqWeightedSum / day.freqWeightTotal : 0,
@@ -616,6 +620,24 @@ export async function executeAutomationsForProduct(productId: string): Promise<v
         frequencyWindow.length > 0
           ? frequencyWindow.reduce((sum, day) => sum + day.cpa, 0) / frequencyWindow.length
           : 0;
+
+      // Attribution gap: Kirvano=0 mas Pixel>0 sugere kirvanoProductId errado
+      // ou UTM não chegou no checkout. Antes pausava igual e gestor não via
+      // a causa real. Agora abstém-se e loga pra investigação humana.
+      const pixelSeesSales =
+        frequencyWindow.length > 0 &&
+        frequencyWindow.some(day => (day.salesPixel ?? 0) > 0);
+      if (noRecentSales && pixelSeesSales) {
+        await logAction({
+          productId,
+          action: "kirvano_attribution_missing",
+          entityType: "adset",
+          entityId: s.adsetId,
+          entityName: s.adsetName,
+          details: `Kirvano=0 mas Pixel reporta venda. Verifique kirvanoProductId/UTM antes de pausar.`,
+        });
+        continue;
+      }
 
       if (
         allAboveLimit &&

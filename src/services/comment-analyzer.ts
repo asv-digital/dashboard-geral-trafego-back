@@ -131,13 +131,21 @@ async function getTrackedAds(
   }
 }
 
+interface ClassifyResult {
+  sentiments: Sentiment[];
+  failed: boolean; // true se LLM falhou ou retornou formato inválido
+}
+
 async function classifyComments(
   productName: string,
   productPrice: number,
   comments: string[]
-): Promise<Sentiment[]> {
+): Promise<ClassifyResult> {
   if (!(await isLLMConfigured()) || comments.length === 0) {
-    return comments.map(() => "neutral" as Sentiment);
+    return {
+      sentiments: comments.map(() => "neutral" as Sentiment),
+      failed: !(await isLLMConfigured()) && comments.length > 0,
+    };
   }
 
   // System prompt é marcado com cache_control no wrapper.
@@ -167,12 +175,15 @@ ${comments.map((c, i) => `${i + 1}. ${c}`).join("\n")}`;
       maxTokens: 2000,
     });
     if (!Array.isArray(result) || result.length !== comments.length) {
-      return comments.map(() => "neutral");
+      console.warn(
+        `[comment-analyzer] LLM retornou formato inválido (esperado array length=${comments.length})`,
+      );
+      return { sentiments: comments.map(() => "neutral"), failed: true };
     }
-    return result;
+    return { sentiments: result, failed: false };
   } catch (err) {
     console.error("[comment-analyzer] classificação falhou:", err);
-    return comments.map(() => "neutral");
+    return { sentiments: comments.map(() => "neutral"), failed: true };
   }
 }
 
@@ -199,7 +210,7 @@ export async function analyzeCommentsForProduct(productId: string): Promise<void
     const newOnes = raw.filter(r => !existingIds.has(r.id));
     if (newOnes.length === 0) continue;
 
-    const sentiments = await classifyComments(
+    const { sentiments, failed } = await classifyComments(
       product.name,
       product.priceGross,
       newOnes.map(c => c.message)
@@ -217,7 +228,10 @@ export async function analyzeCommentsForProduct(productId: string): Promise<void
             message: c.message,
             authorName: c.from?.name,
             sentiment: sentiments[i],
-            analyzedAt: new Date(),
+            // Quando classificador falha, marca analyzedAt=null pra distinguir
+            // "neutral real" de "neutral fallback". AdCommentSummary deve
+            // ignorar registros com analyzedAt=null no rate de objection.
+            analyzedAt: failed ? null : new Date(),
           },
         });
       } catch {

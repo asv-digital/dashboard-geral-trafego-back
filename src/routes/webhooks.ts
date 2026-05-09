@@ -174,10 +174,13 @@ router.post("/kirvano", async (req: Request, res: Response) => {
       res.status(401).json({ error: "invalid_token" });
       return;
     }
-  } else if (process.env.NODE_ENV === "production" && !hmacSecret) {
-    // Sem token nem HMAC em produção = porta aberta. Recusa.
+  } else if (process.env.NODE_ENV !== "development" && !hmacSecret) {
+    // Default-deny fora de development. Antes só bloqueava em
+    // NODE_ENV==="production" — staging/preview com NODE_ENV vazio passava.
+    // Agora qualquer ambiente que não seja explicitamente "development"
+    // exige token ou HMAC.
     console.error(
-      "[webhook] CRITICAL: Kirvano sem token nem HMAC em producao. Configure kirvanoWebhookToken em /settings ou KIRVANO_WEBHOOK_HMAC_SECRET no env."
+      "[webhook] CRITICAL: Kirvano sem token nem HMAC fora de dev. Configure kirvanoWebhookToken em /settings ou KIRVANO_WEBHOOK_HMAC_SECRET no env."
     );
     res.status(503).json({ error: "webhook_not_configured" });
     return;
@@ -212,9 +215,29 @@ router.post("/kirvano", async (req: Request, res: Response) => {
     payload.payment?.amount,
     payload.payment?.total
   );
+
+  const isPurchaseEvent =
+    event === "purchase" ||
+    event === "approved" ||
+    event === "approved_payment" ||
+    event === "sale_approved" ||
+    event === "paid";
+
+  if (!parsedAmount && isPurchaseEvent) {
+    // Antes: caía em priceGross silenciosamente. Risco: payload regression
+    // aparece como amount=0/null em sale "approved" → ROAS contaminado.
+    // Agora: 4xx pra Kirvano fazer retry visível.
+    console.error(
+      `[webhook] tx=${txId} produto=${product.slug} event=${event} sem amount — recusando (4xx) pra retry`,
+    );
+    res.status(422).json({ error: "missing_amount", txId });
+    return;
+  }
   if (!parsedAmount) {
+    // Eventos não-purchase (refund, chargeback) podem chegar sem amount;
+    // usa priceGross só pra registrar evento, sem afetar receita corrente.
     console.warn(
-      `[webhook] payload sem amount para tx=${txId}, produto=${product.slug}. Usando priceGross R$${product.priceGross} como fallback.`
+      `[webhook] payload sem amount para tx=${txId}, evento=${event}, produto=${product.slug}. Usando priceGross R$${product.priceGross} como fallback (não-purchase).`,
     );
   }
   const amountGross = parsedAmount || product.priceGross;
@@ -267,12 +290,7 @@ router.post("/kirvano", async (req: Request, res: Response) => {
     if (camp) campaignId = camp.id;
   }
 
-  const isPurchase =
-    event === "purchase" ||
-    event === "approved" ||
-    event === "approved_payment" ||
-    event === "sale_approved" ||
-    event === "paid";
+  const isPurchase = isPurchaseEvent;
   const isPending = event.startsWith("pending") || event === "waiting_payment";
   const isRefund = event === "refund" || event === "refunded";
   const isChargeback = event === "chargeback";
@@ -369,15 +387,10 @@ router.post("/kirvano", async (req: Request, res: Response) => {
         clientIp: prep?.clientIp ?? null,
         clientUserAgent: prep?.clientUserAgent ?? null,
         eventSourceUrl: prep?.landingUrl ?? product.landingUrl ?? null,
-        // externalId estavel = sale.id apos create. Por enquanto deixa null
-        // e atualizamos abaixo (precisa do id Prisma gerado).
+        // externalId = txId (estável, único e atômico no create —
+        // antes era sale.id setado em update follow-up: race window).
+        externalId: txId,
       },
-    });
-
-    // externalId = sale.id (estavel, unico, no nosso controle).
-    await prisma.sale.update({
-      where: { id: sale.id },
-      data: { externalId: sale.id },
     });
 
     await logAction({
@@ -414,7 +427,7 @@ router.post("/kirvano", async (req: Request, res: Response) => {
             phone: customerPhone,
             firstName,
             lastName,
-            externalId: sale.id,
+            externalId: txId,
             fbc: prep?.fbc ?? undefined,
             fbp: prep?.fbp ?? undefined,
             clientIpAddress: prep?.clientIp ?? undefined,

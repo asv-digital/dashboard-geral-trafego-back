@@ -175,6 +175,20 @@ export async function addBuyerToCustomAudience(
       const err = await res.text();
       return { ok: false, error: `audience http ${res.status}: ${err}` };
     }
+    // Meta retorna { audience_id, num_received, num_invalid_entries, ... }
+    // num_received=0 indica que o registro foi rejeitado (formato inválido,
+    // audience cap, etc.) — antes silenciávamos com {ok: true} sem detectar.
+    const json = (await res.json().catch(() => ({}))) as {
+      num_received?: number;
+      num_invalid_entries?: number;
+      invalid_entry_samples?: unknown;
+    };
+    if (typeof json.num_received === "number" && json.num_received === 0) {
+      console.warn(
+        `[capi] audience=${audienceId} num_received=0 invalid=${json.num_invalid_entries ?? "?"} — registro rejeitado pelo Meta`,
+      );
+      return { ok: false, error: "audience_no_received" };
+    }
     return { ok: true };
   } catch (err) {
     return { ok: false, error: (err as Error).message };

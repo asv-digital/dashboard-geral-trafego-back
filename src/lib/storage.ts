@@ -177,18 +177,3 @@ export async function deleteObject(key: string): Promise<void> {
   await fs.rm(target, { force: true });
 }
 
-export async function getPresignedUploadUrl(
-  productId: string,
-  originalName: string,
-  contentType: string
-): Promise<{ key: string; uploadUrl: string }> {
-  const key = generateKey(productId, originalName);
-  const c = getClient();
-  const cmd = new PutObjectCommand({
-    Bucket: bucket,
-    Key: key,
-    ContentType: contentType,
-  });
-  const uploadUrl = await getSignedUrl(c, cmd, { expiresIn: 15 * 60 });
-  return { key, uploadUrl };
-}

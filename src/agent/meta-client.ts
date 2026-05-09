@@ -200,29 +200,6 @@ export class MetaClient {
     return rows;
   }
 
-  async getActiveCampaigns(): Promise<Array<{ id: string; name: string; status: string }>> {
-    const url =
-      `${BASE_URL}/${this.accountId}/campaigns` +
-      `?fields=id,name,effective_status` +
-      `&filtering=[{"field":"effective_status","operator":"IN","value":["ACTIVE","PAUSED"]}]` +
-      `&limit=100` +
-      `&access_token=${this.token}`;
-
-    const res = await this.throttledFetch(url);
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`Meta API error: ${err}`);
-    }
-
-    const json = (await res.json()) as {
-      data: Array<{ id: string; name: string; effective_status: string }>;
-    };
-    return json.data.map(c => ({
-      id: c.id,
-      name: c.name,
-      status: c.effective_status,
-    }));
-  }
 }
 
 export function getActionValue(

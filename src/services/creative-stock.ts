@@ -158,14 +158,26 @@ export async function checkCreativeStockForProduct(productId: string): Promise<v
       const metaCampaignId = creative?.campaignId
         ? campaignByDbId.get(creative.campaignId)
         : undefined;
-      const matchingAds = metaCampaignId
-        ? trackedAds.filter(
-            ad =>
-              ad.campaignId === metaCampaignId &&
-              creativeMatchesAdName(ex.name, ad.name) &&
-              ad.status === "ACTIVE"
-          )
-        : [];
+
+      // Match prioritário por metaAdId estável (creative-performance popula).
+      // Fallback por nome só se metaAdId ainda não foi atribuído. Antes
+      // tudo era por nome — adId renomeado no Meta UI quebrava match e
+      // creative ficava marcado "exhausted" no DB enquanto o ad seguia
+      // queimando budget.
+      let matchingAds: typeof trackedAds = [];
+      if (creative?.metaAdId) {
+        matchingAds = trackedAds.filter(
+          ad => ad.id === creative.metaAdId && ad.status === "ACTIVE",
+        );
+      }
+      if (matchingAds.length === 0 && metaCampaignId) {
+        matchingAds = trackedAds.filter(
+          ad =>
+            ad.campaignId === metaCampaignId &&
+            creativeMatchesAdName(ex.name, ad.name) &&
+            ad.status === "ACTIVE",
+        );
+      }
 
       let pausedAds = 0;
       for (const ad of matchingAds) {
@@ -185,7 +197,7 @@ export async function checkCreativeStockForProduct(productId: string): Promise<v
         details:
           pausedAds > 0
             ? `${ex.reason}. ${pausedAds} anúncio(s) pausado(s) no Meta.`
-            : `${ex.reason}. Nenhum anúncio ativo correspondente foi encontrado no Meta.`,
+            : `${ex.reason}. Nenhum anúncio ativo correspondente foi encontrado no Meta (metaAdId=${creative?.metaAdId ?? "null"}).`,
       });
     }
   }
