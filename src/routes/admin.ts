@@ -1,15 +1,13 @@
 // Rotas admin pra debug/manutencao. Auth via header X-Admin-Key vs env ADMIN_API_KEY.
-// SOMENTE LEITURA do Meta Graph API. POST/DELETE/PATCH ficam com requireAuth normal.
-//
-// Uso (eu via curl):
-//   curl -H "X-Admin-Key: $KEY" "https://trafego.bravy.com.br/api/admin/meta-graph?path=me/permissions"
-//   curl -H "X-Admin-Key: $KEY" "https://trafego.bravy.com.br/api/admin/meta-graph?path=act_X/campaigns&fields=id,name,status&limit=10"
-//
-// O endpoint pega o metaAccessToken do GlobalSettings (mesmo que a dash usa pra
-// agente). Nao expoe o token. So permite GET. Path obrigatorio.
+// Meta Graph API: somente LEITURA. POST de monthly-goal, asset-upload e
+// asset-text liberados pra eu (Claude) operar via curl sem cookie.
 
 import { Router, Request, Response } from "express";
+import multer from "multer";
 import { getResolvedGlobalSettings } from "../lib/runtime-config";
+import { uploadBuffer } from "../lib/storage";
+import { uploadAssetToMeta } from "../services/content-ingest";
+import { generateTextForAsset } from "../services/creative-text-generator";
 
 const router = Router();
 
@@ -134,6 +132,72 @@ router.get("/products", async (_req: Request, res: Response) => {
     orderBy: { createdAt: "desc" },
   });
   res.json({ products });
+});
+
+// POST /admin/upload-asset — upload multipart de criativo (imagem/video).
+// Replica o flow de /api/assets sem precisar de cookie. Eu uso pra subir
+// criativos do Matheus em massa. Dispara uploadAssetToMeta em background.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 500 * 1024 * 1024 } });
+router.post("/upload-asset", upload.single("file"), async (req: Request, res: Response) => {
+  const productId = String(req.body.productId || "");
+  const type = String(req.body.type || "");
+  const name = String(req.body.name || "");
+  if (!productId || (type !== "image" && type !== "video")) {
+    res.status(400).json({ error: "missing_fields", required: ["productId", "type=image|video", "file"] });
+    return;
+  }
+  if (!req.file) {
+    res.status(400).json({ error: "missing_file" });
+    return;
+  }
+  const prisma = (await import("../prisma")).default;
+  const product = await prisma.product.findUnique({ where: { id: productId } });
+  if (!product) {
+    res.status(404).json({ error: "product_not_found" });
+    return;
+  }
+  try {
+    const uploaded = await uploadBuffer(productId, req.file.originalname, req.file.buffer, req.file.mimetype);
+    const asset = await prisma.productAsset.create({
+      data: {
+        productId,
+        type,
+        name: name || req.file.originalname,
+        status: "uploaded",
+        originalUrl: uploaded.url,
+        r2Key: uploaded.key,
+        mimeType: req.file.mimetype,
+        sizeBytes: uploaded.size,
+        uploadedBy: "admin-curl",
+      },
+    });
+    // Background: tenta sync pro Meta. Se falhar, asset fica com status=uploaded
+    // e o erro fica no campo error.
+    uploadAssetToMeta(asset.id).catch(err =>
+      console.error(`[admin] upload-asset meta sync ${asset.id}:`, err),
+    );
+    res.status(201).json({ asset });
+  } catch (err) {
+    res.status(500).json({ error: "internal", message: (err as Error).message });
+  }
+});
+
+// POST /admin/asset/:assetId/auto-text — gera copy/headline/hook via Anthropic
+router.post("/asset/:assetId/auto-text", async (req: Request, res: Response) => {
+  const assetId = String(req.params.assetId);
+  const prisma = (await import("../prisma")).default;
+  const asset = await prisma.productAsset.findUnique({ where: { id: assetId } });
+  if (!asset) {
+    res.status(404).json({ error: "not_found" });
+    return;
+  }
+  try {
+    const generated = await generateTextForAsset(asset.productId, assetId);
+    res.json({ generated });
+  } catch (err) {
+    const code = err instanceof Error ? err.message : "internal";
+    res.status(500).json({ error: code });
+  }
 });
 
 export default router;
