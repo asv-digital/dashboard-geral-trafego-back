@@ -6,7 +6,7 @@ export type PlannerAudienceKey =
   | "lookalike_1_3"
   | "website_visitors_30d";
 
-type PlannerCampaignType = "Prospecção" | "Remarketing" | "ASC";
+type PlannerCampaignType = "Prospecção" | "Remarketing" | "ASC" | "CBO Mirror Winners";
 type PlannerFunnelStage = "cold" | "warm" | "scale";
 
 export interface PlannerPlaybookCampaign {
@@ -157,6 +157,34 @@ function warmCampaign(
     funnelStage: "warm",
     copyAngle,
     objective,
+    strategyNote,
+    creativeSlotLimit,
+  };
+}
+
+// CBO Mirror Winners — modalidade calibrada com dados reais. Replica padrão
+// observado em [57AGENTS] CBO MIRROR WINNERS R$500/d que consolida top
+// criativos validados em 1 CBO. Usa Advantage+ Audience pra deixar Meta
+// distribuir entre os top performers.
+function cboMirrorWinnersCampaign(
+  weight: number,
+  creativeSlotLimit: number,
+  copyAngle: string,
+  strategyNote: string
+): PlannerPlaybookCampaign {
+  return {
+    name: "CBO — Mirror Winners",
+    type: "CBO Mirror Winners",
+    dailyBudget: 0,
+    budgetWeight: weight,
+    audience: "advantage_plus",
+    targeting: targetingBase(25, 65, true),
+    optimizationGoal: "OFFSITE_CONVERSIONS",
+    usesAdvantage: true,
+    priority: 1,
+    funnelStage: "scale",
+    copyAngle,
+    objective: "consolidar criativos validados em CBO unico R$500+/d",
     strategyNote,
     creativeSlotLimit,
   };
@@ -354,7 +382,13 @@ export function buildPlannerPlaybook(
 
   if (stage === "escalavel") {
     playbook = [
-      coldCampaign("ASC — Escala", 0.3, {
+      cboMirrorWinnersCampaign(
+        0.32,
+        creativeSlotLimit,
+        "consolidar criativos top + Advantage+ Audience",
+        "CBO Mirror Winners replica padrao real (R$500/d single CBO consolida winners). Roda quando ja tem criativo validado.",
+      ),
+      coldCampaign("ASC — Escala", 0.22, {
         ageMin: 18,
         ageMax: 65,
         copyAngle: "beneficio amplo + prova",
@@ -365,9 +399,9 @@ export function buildPlannerPlaybook(
         priority: 1,
         usesAdvantage: true,
       }),
-      coldCampaign("PROSP Broad — Controle", 0.28, {
-        ageMin: 21,
-        ageMax: 55,
+      coldCampaign("PROSP Broad — Controle", 0.2, {
+        ageMin: 25,
+        ageMax: 60,
         copyAngle: "dor + mecanismo",
         objective: "manter benchmark frio e validar se a escala continua saudavel fora do algoritmo",
         strategyNote:
@@ -377,7 +411,7 @@ export function buildPlannerPlaybook(
       }),
       lookalikeCampaign(
         "PROSP LAL 1-3% — Compradores",
-        0.22,
+        0.16,
         creativeSlotLimit,
         "prova + semelhanca",
         "expandir sinal de compradores sem depender so de broad",
@@ -385,7 +419,7 @@ export function buildPlannerPlaybook(
       ),
       warmCampaign(
         "RMK Quente — Prova e Objecao",
-        0.2,
+        0.1,
         creativeSlotLimit,
         "objecao + prova + CTA",
         "recuperar demanda morna/quente com mensagem de fechamento",
@@ -397,7 +431,52 @@ export function buildPlannerPlaybook(
   }
 
   if (stage === "evergreen") {
-    playbook = [
+    const evergreenIncludesCbo = tier === "validated" || tier === "scale";
+    playbook = evergreenIncludesCbo
+      ? [
+          cboMirrorWinnersCampaign(
+            0.28,
+            creativeSlotLimit,
+            "CBO consolidado Advantage+ — replica padrao real",
+            "Quando ja tem criativos validados, CBO Mirror Winners sustenta volume com 1 estrutura R$500+/d.",
+          ),
+          coldCampaign("PROSP Broad — Controle", 0.18, {
+            ageMin: 25,
+            ageMax: 60,
+            copyAngle: "dor + mecanismo",
+            objective: "manter previsibilidade no topo de funil",
+            strategyNote: "Broad protege conta contra dependencia exclusiva de automacao.",
+            creativeSlotLimit,
+            priority: 3,
+          }),
+          coldCampaign("ASC — Sustentacao", 0.18, {
+            ageMin: 25,
+            ageMax: 65,
+            copyAngle: "beneficio direto + prova",
+            objective: "manter Advantage+ Shopping standalone como camada de descoberta",
+            strategyNote: "ASC complementar ao CBO, nao substituto.",
+            creativeSlotLimit,
+            priority: 2,
+            usesAdvantage: true,
+          }),
+          warmCampaign(
+            "RMK Quente — Oferta e Urgencia",
+            0.18,
+            creativeSlotLimit,
+            "oferta + urgencia + objecao",
+            "transformar visitas em caixa com mensagem de fechamento",
+            "Warm audience com mensagem decisiva, nao descoberta.",
+          ),
+          lookalikeCampaign(
+            "PROSP LAL 1-3% — Compradores",
+            0.18,
+            creativeSlotLimit,
+            "prova + semelhanca",
+            "expansao controlada via lookalike de compradores",
+            "Lookalike foge de fadiga do broad e mantem qualidade.",
+          ),
+        ]
+      : [
       coldCampaign("PROSP Broad — Controle", 0.25, {
         ageMin: 23,
         ageMax: 55,
@@ -435,7 +514,7 @@ export function buildPlannerPlaybook(
         "transformar visitas e engajamento em caixa com mensagem de fechamento",
         "Warm audience deve falar com prova, objecao e senso de decisao, nao com descoberta."
       ),
-    ];
+        ];
 
     return allocateBudgets(playbook, dailyBudgetTarget);
   }

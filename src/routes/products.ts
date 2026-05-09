@@ -43,6 +43,10 @@ const createSchema = z.object({
 
   supervisedMode: z.boolean().default(false),
   autoActivate: z.boolean().default(false),
+
+  // CSV de sub-nichos (ex: "advocacia,contabilidade,engenharia"). Quando
+  // preenchido, planner gera 1 estrutura por nicho.
+  niches: z.string().optional(),
 });
 
 const updateSchema = createSchema.partial().extend({
@@ -130,6 +134,7 @@ router.post("/", requireRole("owner", "editor"), async (req: Request, res: Respo
         utmNaming: data.utmNaming,
         supervisedMode: data.supervisedMode,
         autoActivate: data.autoActivate,
+        niches: data.niches,
         automationConfig: {
           create: {
             breakevenCPA: thresholds.breakevenCPA,

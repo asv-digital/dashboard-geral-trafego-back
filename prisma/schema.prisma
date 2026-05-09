@@ -111,6 +111,11 @@ model Product {
   // true: ativa imediatamente após criar no Meta
   autoActivate Boolean @default(false)
 
+  // Sub-nichos do produto (CSV). Quando preenchido, planner gera 1 estrutura
+  // de campanha POR nicho (ex: "advocacia,contabilidade,engenharia"). Quando
+  // null, planner trata produto como funil único (default).
+  niches String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -222,6 +227,12 @@ model ProductAutomationConfig {
   budgetFloorRemarketing Float
 
   daypartingEnabled Boolean @default(false)
+
+  // Flag indicando se thresholds foram calibrados com dado real (true) ou
+  // derivados apenas da economia teórica (false). Calibração 09/05/2026 baseada
+  // em campanhas top performer da conta (CPA Advogados R$52, ROAS 2.13x).
+  calibratedFromRealData Boolean   @default(false)
+  calibratedAt           DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

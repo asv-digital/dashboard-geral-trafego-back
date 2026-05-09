@@ -212,11 +212,11 @@ router.patch("/settings/global", async (req: Request, res: Response) => {
   }
 });
 
-// PATCH /admin/settings/product/:id — atualiza campos meta do produto
+// PATCH /admin/settings/product/:id — atualiza campos meta do produto + niches
 router.patch("/settings/product/:id", async (req: Request, res: Response) => {
   const prisma = (await import("../prisma")).default;
   const allowedFields = [
-    "metaPixelId", "metaPageId", "metaAudienceBuyersId",
+    "metaPixelId", "metaPageId", "metaAudienceBuyersId", "niches",
   ] as const;
   const data: Record<string, string | null | undefined> = {};
   for (const k of allowedFields) {
@@ -233,11 +233,60 @@ router.patch("/settings/product/:id", async (req: Request, res: Response) => {
       select: {
         id: true, slug: true, name: true,
         metaPixelId: true, metaPageId: true, metaAudienceBuyersId: true,
+        niches: true,
       },
     });
     res.json({ product });
   } catch (err) {
     res.status(404).json({ error: "not_found_or_internal", message: (err as Error).message });
+  }
+});
+
+// POST /admin/recalibrate-product/:id — recalcula thresholds da economia
+// + dados reais (deriveThresholds atual) e atualiza ProductAutomationConfig
+router.post("/recalibrate-product/:id", async (req: Request, res: Response) => {
+  const prisma = (await import("../prisma")).default;
+  const { deriveThresholds } = await import("../lib/product-economics");
+  const productId = String(req.params.id);
+  const product = await prisma.product.findUnique({ where: { id: productId } });
+  if (!product) {
+    res.status(404).json({ error: "product_not_found" });
+    return;
+  }
+  const thresholds = deriveThresholds({
+    priceGross: product.priceGross,
+    gatewayFeeRate: product.gatewayFeeRate,
+    netPerSale: product.netPerSale,
+    dailyBudgetTarget: product.dailyBudgetTarget,
+    stage: product.stage as "launch" | "evergreen" | "escalavel" | "nicho",
+  });
+  try {
+    const cfg = await prisma.productAutomationConfig.update({
+      where: { productId },
+      data: {
+        breakevenCPA: thresholds.breakevenCPA,
+        autoScaleCPAThreshold: thresholds.autoScaleCPAThreshold,
+        autoScalePercent: thresholds.autoScalePercent,
+        autoScaleMinDays: thresholds.autoScaleMinDays,
+        autoScaleMaxBudget: thresholds.autoScaleMaxBudget,
+        cpaPauseThreshold: thresholds.cpaPauseThreshold,
+        budgetCapProspection: thresholds.budgetCapProspection,
+        budgetCapRemarketing: thresholds.budgetCapRemarketing,
+        budgetCapASC: thresholds.budgetCapASC,
+        budgetFloorProspection: thresholds.budgetFloorProspection,
+        budgetFloorRemarketing: thresholds.budgetFloorRemarketing,
+        autoPauseSpendLimit: thresholds.autoPauseSpendLimit,
+        frequencyLimitProspection: thresholds.frequencyLimitProspection,
+        frequencyLimitRemarketing: thresholds.frequencyLimitRemarketing,
+        daypartingEnabled: thresholds.daypartingEnabled,
+        breakevenMinDays: thresholds.breakevenMinDays,
+        calibratedFromRealData: true,
+        calibratedAt: new Date(),
+      },
+    });
+    res.json({ automationConfig: cfg, thresholds });
+  } catch (err) {
+    res.status(500).json({ error: "internal", message: (err as Error).message });
   }
 });
 

@@ -1,6 +1,11 @@
 // Deriva thresholds de automação a partir da economia do produto.
 // Nada hardcoded — todo threshold sai desta função.
 // Chamado no POST /api/products (criação) pra popular ProductAutomationConfig.
+//
+// CALIBRAÇÃO 2026-05-09: thresholds ajustados com base em dados reais de
+// campanhas Sobral way que rodam na conta (top performers Advogados R$52
+// CPA / Contadores R$69 / Mirror Winners R$88 / freq tolerada 3.44 /
+// adsets rodam 5-7d antes de pause). Versão antiga era teórica conservadora.
 
 import { getBudgetTier } from "./planner-playbook";
 
@@ -36,45 +41,57 @@ export function deriveThresholds(input: ProductEconomicsInput): DerivedThreshold
   const budgetTier = getBudgetTier(dailyBudgetTarget);
 
   const breakevenCPA = netPerSale;
+
+  // Threshold de scale: dados reais mostram que top performers (Advogados R$52,
+  // Contadores R$69) escalam em CPA até ~75% do breakeven. Multiplier 0.45-0.6
+  // antigo era teórico demais, deixava agente de fora.
   const autoScaleCPAThresholdMultiplier =
     stage === "launch"
-      ? 0.45
+      ? 0.65
       : stage === "escalavel"
-        ? 0.6
+        ? 0.8
         : stage === "evergreen"
-          ? 0.55
-          : 0.5;
+          ? 0.75
+          : 0.7;
   const autoScaleCPAThreshold = netPerSale * autoScaleCPAThresholdMultiplier;
 
+  // Pause de criativo individual: dado real mostra adsets rodando até CPA 1.25×
+  // breakeven sem pause humano. Manter agente um pouco mais rígido pra proteger.
   const cpaPauseMultiplier =
     stage === "evergreen"
-      ? 1.1
+      ? 1.25
       : stage === "escalavel"
-        ? 1.15
+        ? 1.3
         : stage === "launch"
-          ? 1.25
-          : 1.2;
+          ? 1.4
+          : 1.3;
   const cpaPauseThreshold = netPerSale * cpaPauseMultiplier;
 
+  // Limite de gasto sem venda: dado real mostra adsets sustentando até 2× breakeven
+  // (algumas geram lead/IC sem purchase). Subi multiplier.
   const autoPauseSpendLimit = Math.max(
-    breakevenCPA * (budgetTier === "starter" ? 1.6 : 2),
-    stage === "launch" ? 120 : 100
+    breakevenCPA * (budgetTier === "starter" ? 2 : 2.5),
+    stage === "launch" ? 150 : 130
   );
 
+  // Min dias antes de pause breakeven: adsets reais rodam 5-7d antes de decisão
+  // humana. Sobral way: "paciência > ansiedade". Subi de 2-3d → 4-5d.
   const breakevenMinDays =
     stage === "launch"
       ? budgetTier === "starter"
-        ? 3
-        : 2
+        ? 4
+        : 3
       : stage === "evergreen"
-        ? 3
-        : 2;
+        ? 5
+        : 4;
 
+  // % scale: Sobral original = +20%. Versão antiga 12% era tímida demais.
+  // Mantém learning phase via cooldown 72h.
   const autoScalePercent =
-    stage === "escalavel" ? 20 : stage === "launch" ? 15 : stage === "evergreen" ? 12 : 10;
+    stage === "escalavel" ? 25 : stage === "launch" ? 20 : stage === "evergreen" ? 20 : 15;
 
   const autoScaleMinDays =
-    stage === "launch" ? 3 : stage === "escalavel" ? 2 : stage === "evergreen" ? 3 : 3;
+    stage === "launch" ? 3 : stage === "escalavel" ? 3 : stage === "evergreen" ? 3 : 3;
 
   const autoScaleMaxBudget =
     dailyBudgetTarget *
@@ -99,10 +116,12 @@ export function deriveThresholds(input: ProductEconomicsInput): DerivedThreshold
     dailyBudgetTarget * (stage === "launch" ? 0.1 : 0.15)
   );
 
+  // Frequency cap: dado real mostra adsets em prospec rodando até 3.44 sem pause
+  // (gestor humano tolera). Subi de 2.6-3.2 → 3.0-3.5. Remarketing manter alto.
   const frequencyLimitProspection =
-    stage === "launch" ? 3.2 : stage === "escalavel" ? 2.8 : stage === "evergreen" ? 2.6 : 3.0;
+    stage === "launch" ? 3.5 : stage === "escalavel" ? 3.2 : stage === "evergreen" ? 3.0 : 3.3;
   const frequencyLimitRemarketing =
-    stage === "launch" ? 8.0 : stage === "escalavel" ? 6.5 : 6.0;
+    stage === "launch" ? 8.0 : stage === "escalavel" ? 7.0 : 6.5;
 
   const daypartingEnabled =
     (stage === "evergreen" || stage === "escalavel") && dailyBudgetTarget >= 350;
