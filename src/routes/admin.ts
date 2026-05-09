@@ -182,6 +182,65 @@ router.post("/upload-asset", upload.single("file"), async (req: Request, res: Re
   }
 });
 
+// PATCH /admin/settings/global — atualiza GlobalSettings (apenas campos meta-related)
+router.patch("/settings/global", async (req: Request, res: Response) => {
+  const prisma = (await import("../prisma")).default;
+  const allowedFields = [
+    "metaAdAccountId", "metaPixelId", "metaPageId",
+    "metaAudienceBuyersId", "metaAudienceWarmId", "metaAudienceWarmName",
+  ] as const;
+  const data: Record<string, string | null | undefined> = {};
+  for (const k of allowedFields) {
+    if (k in req.body) data[k] = req.body[k] === "" ? null : req.body[k];
+  }
+  if (Object.keys(data).length === 0) {
+    res.status(400).json({ error: "no_fields", allowed: allowedFields });
+    return;
+  }
+  try {
+    const settings = await prisma.globalSettings.upsert({
+      where: { id: "singleton" },
+      create: { id: "singleton", ...data },
+      update: data,
+    });
+    // Invalida cache
+    const { clearRuntimeConfigCache } = await import("../lib/runtime-config");
+    clearRuntimeConfigCache("global");
+    res.json({ settings });
+  } catch (err) {
+    res.status(500).json({ error: "internal", message: (err as Error).message });
+  }
+});
+
+// PATCH /admin/settings/product/:id — atualiza campos meta do produto
+router.patch("/settings/product/:id", async (req: Request, res: Response) => {
+  const prisma = (await import("../prisma")).default;
+  const allowedFields = [
+    "metaPixelId", "metaPageId", "metaAudienceBuyersId",
+  ] as const;
+  const data: Record<string, string | null | undefined> = {};
+  for (const k of allowedFields) {
+    if (k in req.body) data[k] = req.body[k] === "" ? null : req.body[k];
+  }
+  if (Object.keys(data).length === 0) {
+    res.status(400).json({ error: "no_fields", allowed: allowedFields });
+    return;
+  }
+  try {
+    const product = await prisma.product.update({
+      where: { id: String(req.params.id) },
+      data,
+      select: {
+        id: true, slug: true, name: true,
+        metaPixelId: true, metaPageId: true, metaAudienceBuyersId: true,
+      },
+    });
+    res.json({ product });
+  } catch (err) {
+    res.status(404).json({ error: "not_found_or_internal", message: (err as Error).message });
+  }
+});
+
 // POST /admin/asset/:assetId/auto-text — gera copy/headline/hook via Anthropic
 router.post("/asset/:assetId/auto-text", async (req: Request, res: Response) => {
   const assetId = String(req.params.assetId);
