@@ -20,6 +20,7 @@ import placementsRoutes from "./routes/placements";
 import notificationsRoutes from "./routes/notifications";
 import checkoutPrepRoutes from "./routes/checkout-prep";
 import analyticsRoutes from "./routes/analytics";
+import adminRoutes from "./routes/admin";
 import { deleteExpiredSessions } from "./auth/session";
 import { startScheduler } from "./agent/scheduler";
 import { startDailySummary } from "./services/daily-summary";
@@ -89,6 +90,7 @@ app.use("/api/planner", plannerRoutes);
 app.use("/api/placements", placementsRoutes);
 app.use("/api/notifications", notificationsRoutes);
 app.use("/api/analytics", analyticsRoutes);
+app.use("/api/admin", adminRoutes);
 
 app.use((_req, res) => {
   res.status(404).json({ error: "not_found" });

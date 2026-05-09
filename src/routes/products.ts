@@ -266,4 +266,75 @@ router.post(
   }
 );
 
+// ═══════════════════════════════════════════════════════════════
+// MONTHLY GOALS — meta mensal de vendas pra ajustar pacing dinamico
+// ═══════════════════════════════════════════════════════════════
+
+router.get("/:id/monthly-goals", async (req: Request, res: Response) => {
+  const goals = await prisma.monthlyGoal.findMany({
+    where: { productId: String(req.params.id) },
+    orderBy: { month: "desc" },
+    take: 24,
+  });
+  res.json({ goals });
+});
+
+const monthlyGoalSchema = z.object({
+  month: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/, "use formato YYYY-MM"),
+  targetSales: z.number().int().positive(),
+  targetCpa: z.number().positive().optional(),
+  targetRoas: z.number().positive().optional(),
+  targetProfit: z.number().optional(),
+});
+
+// POST /:id/monthly-goals — upsert (substitui meta do mes se ja existir)
+router.post(
+  "/:id/monthly-goals",
+  requireRole("owner", "editor"),
+  async (req: Request, res: Response) => {
+    const parsed = monthlyGoalSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid_input", details: parsed.error.issues });
+      return;
+    }
+    const productId = String(req.params.id);
+    const data = parsed.data;
+    try {
+      const goal = await prisma.monthlyGoal.upsert({
+        where: { productId_month: { productId, month: data.month } },
+        create: {
+          productId,
+          month: data.month,
+          targetSales: data.targetSales,
+          targetCpa: data.targetCpa,
+          targetRoas: data.targetRoas,
+          targetProfit: data.targetProfit,
+        },
+        update: {
+          targetSales: data.targetSales,
+          targetCpa: data.targetCpa,
+          targetRoas: data.targetRoas,
+          targetProfit: data.targetProfit,
+        },
+      });
+      res.status(201).json({ goal });
+    } catch (err) {
+      res.status(500).json({ error: "internal", message: (err as Error).message });
+    }
+  },
+);
+
+router.delete(
+  "/:id/monthly-goals/:goalId",
+  requireRole("owner", "editor"),
+  async (req: Request, res: Response) => {
+    try {
+      await prisma.monthlyGoal.delete({ where: { id: String(req.params.goalId) } });
+      res.json({ ok: true });
+    } catch {
+      res.status(404).json({ error: "not_found" });
+    }
+  },
+);
+
 export default router;
