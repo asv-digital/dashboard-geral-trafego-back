@@ -241,13 +241,40 @@ export async function planCampaignsForProduct(
   }
 
   const stage = product.stage as StrategyStage;
+  // Niches: quando preenchidos (CSV), gera 1 variação do playbook por nicho.
+  // Cada variação herda budgetShare ÷ N e ganha sufixo "[nicho]" no nome.
+  // Sem niches → playbook único (comportamento original).
+  const niches =
+    (product.niches ?? "")
+      .split(",")
+      .map(n => n.trim())
+      .filter(Boolean) || [];
+  const basePlaybook = buildPlannerPlaybook(stage, product.dailyBudgetTarget);
+  const expanded =
+    niches.length > 0
+      ? niches.flatMap(nicho =>
+          basePlaybook.map(c => ({
+            ...c,
+            name: `${c.name} [${nicho}]`,
+            dailyBudget: c.dailyBudget / niches.length,
+            budgetWeight:
+              c.budgetWeight !== undefined ? c.budgetWeight / niches.length : undefined,
+            strategyNote: `${c.strategyNote ?? ""} Foco: ${nicho}.`.trim(),
+          })),
+        )
+      : basePlaybook;
   const resolved = await resolvePlaybookAudiences(
     productId,
-    buildPlannerPlaybook(stage, product.dailyBudgetTarget),
+    expanded,
     product.dailyBudgetTarget
   );
   const playbook = resolved.planned;
   const playbookWarnings = [...resolved.warnings];
+  if (niches.length > 0) {
+    playbookWarnings.push(
+      `Plano dividido em ${niches.length} nicho(s): ${niches.join(", ")}. Budget total dividido entre eles.`,
+    );
+  }
   const pendingMediaSync = mediaAssetCandidates.filter(asset => !asset.metaMediaId).length;
   if (pendingMediaSync > 0) {
     playbookWarnings.push(

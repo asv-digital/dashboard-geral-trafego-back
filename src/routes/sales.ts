@@ -37,6 +37,33 @@ router.get("/", async (req: Request, res: Response) => {
   res.json({ sales });
 });
 
+// GET /sales/cart-abandonments?productId=...&days=30 — listar + agregado.
+router.get("/cart-abandonments", async (req: Request, res: Response) => {
+  const productId = String(req.query.productId || "");
+  const days = Math.min(180, Math.max(1, Number(req.query.days || 30)));
+  if (!productId) {
+    res.status(400).json({ error: "missing_productId" });
+    return;
+  }
+  const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  const items = await prisma.cartAbandonment.findMany({
+    where: { productId, date: { gte: cutoff } },
+    orderBy: { date: "desc" },
+    take: 200,
+  });
+  const total = items.length;
+  const recovered = items.filter(c => c.recovered).length;
+  const recoveryRate = total > 0 ? Math.round((recovered / total) * 1000) / 10 : 0;
+  res.json({
+    days,
+    total,
+    recovered,
+    pending: total - recovered,
+    recoveryRate,
+    items,
+  });
+});
+
 router.get("/summary", async (req: Request, res: Response) => {
   const parsed = querySchema.safeParse(req.query);
   if (!parsed.success) {

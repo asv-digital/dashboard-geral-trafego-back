@@ -274,4 +274,46 @@ router.patch("/adsets/budget", async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
+// GET /meta-actions/adsets?productId=... — lista adsets ativos pra UI usar.
+// Whitelist via campanhas tracked (mesma lógica do ensureAdsetBelongsTo).
+router.get("/adsets", async (req: Request, res: Response) => {
+  const productId = String(req.query.productId || "");
+  if (!productId) {
+    res.status(400).json({ error: "missing_productId" });
+    return;
+  }
+
+  const campaigns = await prisma.campaign.findMany({
+    where: { productId, metaCampaignId: { not: null } },
+    select: { id: true, name: true, metaCampaignId: true },
+  });
+  const trackedCampaignIds = campaigns
+    .map(c => c.metaCampaignId)
+    .filter((id): id is string => id !== null);
+  if (trackedCampaignIds.length === 0) {
+    res.json({ adsets: [] });
+    return;
+  }
+
+  const { adAccountId: accountId } = await getResolvedProductMetaSettings();
+  if (!accountId) {
+    res.json({ adsets: [] });
+    return;
+  }
+
+  const adsets = await getActiveAdsetsForCampaigns(accountId, trackedCampaignIds);
+  // Anexa nome da campanha pra UI agrupar
+  const campNameById = new Map(campaigns.map(c => [c.metaCampaignId!, c.name]));
+  res.json({
+    adsets: adsets.map(a => ({
+      id: a.id,
+      name: a.name,
+      campaignId: a.campaignId,
+      campaignName: campNameById.get(a.campaignId) ?? "",
+      dailyBudget: a.dailyBudget,
+      status: a.status,
+    })),
+  });
+});
+
 export default router;

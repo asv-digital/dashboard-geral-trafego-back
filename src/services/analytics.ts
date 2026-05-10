@@ -252,7 +252,7 @@ export interface ProfitWaterfallStep {
   label: string;
   value: number;
   pct: number;
-  kind: "input" | "deduction" | "addition" | "result";
+  kind: "input" | "deduction" | "addition" | "result" | "projection";
 }
 
 export interface ProfitWaterfallResult {
@@ -322,7 +322,14 @@ async function aggregateProfit(
   const affiliateCommission = grossRevenue * (product.affiliateCommissionRate || 0);
   const spend = metricsAgg._sum.investment || 0;
   const mentoriaCount = mentoria._count || 0;
-  const upsellRevenue = mentoriaCount * (product.mentoriaUpsellValue || 0);
+  const upsellValue = product.mentoriaUpsellValue || 0;
+  const upsellRevenue = mentoriaCount * upsellValue;
+  // Projeção: vendas low NÃO convertidas ainda × rate × valor.
+  // Mostra "potencial" do upsell quando histórico real é fino. Quando dado
+  // real existe (mentoriaCount > 0), projeção complementa o que sobra.
+  const upsellRate = product.mentoriaUpsellRate ?? 0;
+  const unconvertedSales = Math.max(0, approvedSales - mentoriaCount);
+  const upsellProjected = unconvertedSales * upsellRate * upsellValue;
   // Receita liquida apos refund/chargeback/fee/comissao
   const netRevenue =
     netRevenueRaw - refundAmount - chargebackAmount - affiliateCommission;
@@ -341,6 +348,7 @@ async function aggregateProfit(
     netRevenueRaw,
     netRevenue,
     upsellRevenue,
+    upsellProjected,
     spend,
     taxEstimate,
     contributionMargin: cm,
@@ -401,10 +409,20 @@ export async function getProfitWaterfall(
     { label: "− Comissão afiliado", value: -current.affiliateCommission, pct: -safePct(current.affiliateCommission), kind: "deduction" },
     { label: "= Receita líquida", value: current.netRevenue, pct: safePct(current.netRevenue), kind: "result" },
     { label: "+ Upsell mentoria", value: current.upsellRevenue, pct: safePct(current.upsellRevenue), kind: "addition" },
+  ];
+  if (current.upsellProjected > 0) {
+    steps.push({
+      label: "+ Upsell projetado",
+      value: current.upsellProjected,
+      pct: safePct(current.upsellProjected),
+      kind: "projection",
+    });
+  }
+  steps.push(
     { label: "− CAC (spend Meta)", value: -current.spend, pct: -safePct(current.spend), kind: "deduction" },
     { label: "− Imposto estimado", value: -current.taxEstimate, pct: -safePct(current.taxEstimate), kind: "deduction" },
     { label: "= Contribution margin", value: current.contributionMargin, pct: cmPct, kind: "result" },
-  ];
+  );
 
   function pctChange(curr: number, prev: number): number | null {
     if (prev === 0) return curr === 0 ? 0 : null;

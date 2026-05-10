@@ -2,9 +2,7 @@
 // Finaliza testes cujo minDays passou E minSpendPerVariant foi atingido.
 // Decide winner por CPA real em nível de adId e pausa o anúncio perdedor.
 //
-// ⚠️ Nenhum endpoint cria CreativeTest hoje. Resolver fica idle (0 testes
-// running) até existir UI/rota pra abrir teste explícito. Seguir lógica
-// completa pra quando o consumer for adicionado.
+// Testes são criados via POST /api/ab-tests (UI: /product/[id]/ab-tests).
 
 import prisma from "../prisma";
 import { canAutomate, acquireLock } from "./automation-coordinator";
@@ -254,9 +252,8 @@ export async function resolveActiveTestsForProduct(productId: string): Promise<v
 }
 
 export async function resolveActiveTestsAll(): Promise<void> {
-  // Short-circuit: hoje ninguém cria CreativeTest. Evita 1 query por produto a
-  // cada ciclo só pra confirmar 0 testes. Quando o consumer for criado,
-  // remover este check.
+  // Short-circuit barato quando não há testes rodando: 1 count vs 1 findMany
+  // por produto. Quando há testes, prossegue com loop por produto ativo.
   const runningCount = await prisma.creativeTest.count({
     where: { status: "running" },
   });

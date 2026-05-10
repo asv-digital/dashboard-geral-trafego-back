@@ -294,9 +294,69 @@ router.post("/kirvano", async (req: Request, res: Response) => {
   const isPending = event.startsWith("pending") || event === "waiting_payment";
   const isRefund = event === "refund" || event === "refunded";
   const isChargeback = event === "chargeback";
+  const isCartAbandoned =
+    event === "cart_abandoned" ||
+    event === "abandoned_cart" ||
+    event === "carrinho_abandonado";
+
+  const saleDate = resolveSaleDate(payload, txId);
+
+  // Cart abandonment: registra pra recuperação posterior (WhatsApp/email).
+  // Idempotente — só cria se não tem abandono não-recuperado pra esse email.
+  if (isCartAbandoned) {
+    try {
+      const existing = await prisma.cartAbandonment.findFirst({
+        where: { productId: product.id, customerEmail, recovered: false },
+        orderBy: { date: "desc" },
+      });
+      if (!existing) {
+        await prisma.cartAbandonment.create({
+          data: {
+            productId: product.id,
+            date: saleDate,
+            customerEmail,
+            customerPhone,
+            customerName,
+            kirvanoProductId,
+            utmSource,
+            utmCampaign,
+            utmContent,
+            checkoutUrl: pickString(payload.checkout_url, payload.kirvano_checkout_url),
+          },
+        });
+        await logAction({
+          productId: product.id,
+          action: "cart_abandoned",
+          entityType: "sale",
+          entityName: customerEmail || txId,
+          details: `Carrinho abandonado · ${utmCampaign || "sem UTM"}`,
+          source: "webhook",
+        });
+      }
+    } catch (err) {
+      console.warn(
+        `[webhook] cart_abandoned tx=${txId} produto=${product.slug} falhou: ${(err as Error).message}`,
+      );
+    }
+    res.json({ ok: true, kind: "cart_abandoned" });
+    return;
+  }
+
+  // Marca recovered=true se uma compra confirmada veio depois do abandono.
+  if (isPurchase && customerEmail) {
+    await prisma.cartAbandonment
+      .updateMany({
+        where: {
+          productId: product.id,
+          customerEmail,
+          recovered: false,
+        },
+        data: { recovered: true },
+      })
+      .catch(() => undefined);
+  }
 
   const amountNet = amountGross * (1 - product.gatewayFeeRate);
-  const saleDate = resolveSaleDate(payload, txId);
   const status = isPurchase
     ? "approved"
     : isPending
