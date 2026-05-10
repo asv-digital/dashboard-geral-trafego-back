@@ -168,9 +168,10 @@ router.get("/product-snapshot/:slugOrId", async (req: Request, res: Response) =>
           where: { productId: product.id },
           select: {
             id: true, type: true, name: true, status: true,
-            awarenessStage: true, metaMediaId: true,
+            awarenessStage: true, metaMediaId: true, metaCreativeId: true,
+            tags: true, mimeType: true, sizeBytes: true, error: true,
             generatedHeadline: true, generatedHook: true, generatedCopy: true,
-            textGeneratedAt: true, archivedAt: true, createdAt: true,
+            textGeneratedAt: true, createdAt: true,
           },
           orderBy: { createdAt: "desc" },
         });
@@ -299,15 +300,22 @@ router.patch("/settings/global", async (req: Request, res: Response) => {
   }
 });
 
-// PATCH /admin/settings/product/:id — atualiza campos meta do produto + niches
+// PATCH /admin/settings/product/:id — atualiza campos meta do produto + niches.
+// Aceita também metaAudienceWarmId pra o produto ter sua warm específica
+// (útil quando a conta tem várias warms e o produto deve usar uma).
 router.patch("/settings/product/:id", async (req: Request, res: Response) => {
   const prisma = (await import("../prisma")).default;
   const allowedFields = [
-    "metaPixelId", "metaPageId", "metaAudienceBuyersId", "niches",
+    "metaPixelId", "metaPageId", "metaAudienceBuyersId",
+    "metaAudienceWarmId", "metaAudienceWarmName",
+    "niches", "mentoriaUpsellValue", "mentoriaUpsellRate", "breakevenCPA",
   ] as const;
-  const data: Record<string, string | null | undefined> = {};
+  const data: Record<string, string | number | null | undefined> = {};
   for (const k of allowedFields) {
-    if (k in req.body) data[k] = req.body[k] === "" ? null : req.body[k];
+    if (k in req.body) {
+      const v = req.body[k];
+      data[k] = v === "" ? null : v;
+    }
   }
   if (Object.keys(data).length === 0) {
     res.status(400).json({ error: "no_fields", allowed: allowedFields });
@@ -319,13 +327,42 @@ router.patch("/settings/product/:id", async (req: Request, res: Response) => {
       data,
       select: {
         id: true, slug: true, name: true,
-        metaPixelId: true, metaPageId: true, metaAudienceBuyersId: true,
-        niches: true,
+        metaPixelId: true, metaPageId: true,
+        metaAudienceBuyersId: true, metaAudienceWarmId: true,
+        metaAudienceWarmName: true,
+        niches: true, mentoriaUpsellValue: true, mentoriaUpsellRate: true,
+        breakevenCPA: true,
       },
     });
     res.json({ product });
   } catch (err) {
     res.status(404).json({ error: "not_found_or_internal", message: (err as Error).message });
+  }
+});
+
+// GET /admin/planner-preview/:slugOrId — roda planner em dryRun (não cria nada
+// no Meta). Permite eu validar plano antes do owner approvar commit.
+router.get("/planner-preview/:slugOrId", async (req: Request, res: Response) => {
+  const prisma = (await import("../prisma")).default;
+  const idOrSlug = String(req.params.slugOrId);
+  const product = await prisma.product.findFirst({
+    where: { OR: [{ id: idOrSlug }, { slug: idOrSlug }] },
+    select: { id: true },
+  });
+  if (!product) {
+    res.status(404).json({ error: "product_not_found" });
+    return;
+  }
+  try {
+    const { planCampaignsForProduct } = await import("../services/campaign-planner");
+    const result = await planCampaignsForProduct(product.id, true);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({
+      error: "planner_failed",
+      message: (err as Error).message,
+      stack: (err as Error).stack?.slice(0, 500),
+    });
   }
 });
 
