@@ -136,68 +136,86 @@ router.get("/products", async (_req: Request, res: Response) => {
 
 // GET /admin/product-snapshot/:slugOrId — snapshot completo pra diagnóstico
 // remoto (eu uso via X-Admin-Key sem precisar logar). Não retorna secrets.
+// Cada bloco em try/catch isolado pra reportar onde falhou.
 router.get("/product-snapshot/:slugOrId", async (req: Request, res: Response) => {
   const prisma = (await import("../prisma")).default;
-  const { runPreflightChecks } = await import("../services/preflight-checks");
   const idOrSlug = String(req.params.slugOrId);
+  const errors: Record<string, string> = {};
 
-  const product = await prisma.product.findFirst({
-    where: { OR: [{ id: idOrSlug }, { slug: idOrSlug }] },
-    include: {
-      automationConfig: true,
-      _count: { select: { campaigns: true, sales: true, assets: true, creatives: true, monthlyGoals: true } },
-    },
-  });
+  let product: any = null;
+  try {
+    product = await prisma.product.findFirst({
+      where: { OR: [{ id: idOrSlug }, { slug: idOrSlug }] },
+      include: { automationConfig: true },
+    });
+  } catch (err) {
+    errors.product = (err as Error).message;
+  }
   if (!product) {
-    res.status(404).json({ error: "product_not_found" });
+    res.status(errors.product ? 500 : 404).json({
+      error: errors.product ? "product_query_failed" : "product_not_found",
+      errors,
+    });
     return;
   }
 
-  const [assets, campaigns, monthlyGoals, lastActions] = await Promise.all([
-    prisma.productAsset.findMany({
-      where: { productId: product.id },
-      select: {
-        id: true, type: true, name: true, status: true,
-        awarenessStage: true, metaMediaId: true,
-        generatedHeadline: true, generatedHook: true, generatedCopy: true,
-        textGeneratedAt: true, archivedAt: true, createdAt: true,
-      },
-      orderBy: { createdAt: "desc" },
-    }),
-    prisma.campaign.findMany({
-      where: { productId: product.id },
-      select: { id: true, name: true, metaCampaignId: true, status: true, isASC: true, createdAt: true },
-    }),
-    prisma.monthlyGoal.findMany({
-      where: { productId: product.id },
-      orderBy: { month: "desc" },
-      take: 3,
-    }),
-    prisma.actionLog.findMany({
-      where: { productId: product.id },
-      orderBy: { executedAt: "desc" },
-      take: 10,
-      select: { id: true, action: true, entityType: true, entityName: true, executedAt: true, source: true },
-    }),
+  const result: Record<string, unknown> = { product, automationConfig: product.automationConfig };
+
+  await Promise.allSettled([
+    (async () => {
+      try {
+        result.assets = await prisma.productAsset.findMany({
+          where: { productId: product.id },
+          select: {
+            id: true, type: true, name: true, status: true,
+            awarenessStage: true, metaMediaId: true,
+            generatedHeadline: true, generatedHook: true, generatedCopy: true,
+            textGeneratedAt: true, archivedAt: true, createdAt: true,
+          },
+          orderBy: { createdAt: "desc" },
+        });
+      } catch (err) { errors.assets = (err as Error).message; }
+    })(),
+    (async () => {
+      try {
+        result.campaigns = await prisma.campaign.findMany({
+          where: { productId: product.id },
+          select: { id: true, name: true, metaCampaignId: true, status: true, isASC: true, createdAt: true },
+        });
+      } catch (err) { errors.campaigns = (err as Error).message; }
+    })(),
+    (async () => {
+      try {
+        result.monthlyGoals = await prisma.monthlyGoal.findMany({
+          where: { productId: product.id }, orderBy: { month: "desc" }, take: 3,
+        });
+      } catch (err) { errors.monthlyGoals = (err as Error).message; }
+    })(),
+    (async () => {
+      try {
+        result.lastActions = await prisma.actionLog.findMany({
+          where: { productId: product.id },
+          orderBy: { executedAt: "desc" },
+          take: 10,
+          select: { id: true, action: true, entityType: true, entityName: true, executedAt: true, source: true },
+        });
+      } catch (err) { errors.lastActions = (err as Error).message; }
+    })(),
+    (async () => {
+      try {
+        result.salesCount = await prisma.sale.count({ where: { productId: product.id } });
+        result.creativesCount = await prisma.creative.count({ where: { productId: product.id } });
+      } catch (err) { errors.counts = (err as Error).message; }
+    })(),
+    (async () => {
+      try {
+        const { runPreflightChecks } = await import("../services/preflight-checks");
+        result.preflight = await runPreflightChecks(product.id);
+      } catch (err) { errors.preflight = (err as Error).message + (err instanceof Error && err.stack ? "\n" + err.stack.slice(0, 500) : ""); }
+    })(),
   ]);
 
-  let preflight: unknown = null;
-  try {
-    preflight = await runPreflightChecks(product.id);
-  } catch (err) {
-    preflight = { error: (err as Error).message };
-  }
-
-  res.json({
-    product,
-    automationConfig: product.automationConfig,
-    counts: product._count,
-    assets,
-    campaigns,
-    monthlyGoals,
-    lastActions,
-    preflight,
-  });
+  res.json({ ...result, errors: Object.keys(errors).length ? errors : undefined });
 });
 
 // POST /admin/upload-asset — upload multipart de criativo (imagem/video).
