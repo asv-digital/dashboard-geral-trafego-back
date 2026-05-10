@@ -134,6 +134,72 @@ router.get("/products", async (_req: Request, res: Response) => {
   res.json({ products });
 });
 
+// GET /admin/product-snapshot/:slugOrId — snapshot completo pra diagnóstico
+// remoto (eu uso via X-Admin-Key sem precisar logar). Não retorna secrets.
+router.get("/product-snapshot/:slugOrId", async (req: Request, res: Response) => {
+  const prisma = (await import("../prisma")).default;
+  const { runPreflightChecks } = await import("../services/preflight-checks");
+  const idOrSlug = String(req.params.slugOrId);
+
+  const product = await prisma.product.findFirst({
+    where: { OR: [{ id: idOrSlug }, { slug: idOrSlug }] },
+    include: {
+      automationConfig: true,
+      _count: { select: { campaigns: true, sales: true, assets: true, creatives: true, monthlyGoals: true } },
+    },
+  });
+  if (!product) {
+    res.status(404).json({ error: "product_not_found" });
+    return;
+  }
+
+  const [assets, campaigns, monthlyGoals, lastActions] = await Promise.all([
+    prisma.productAsset.findMany({
+      where: { productId: product.id },
+      select: {
+        id: true, type: true, name: true, status: true,
+        awarenessStage: true, metaMediaId: true,
+        generatedHeadline: true, generatedHook: true, generatedCopy: true,
+        textGeneratedAt: true, archivedAt: true, createdAt: true,
+      },
+      orderBy: { createdAt: "desc" },
+    }),
+    prisma.campaign.findMany({
+      where: { productId: product.id },
+      select: { id: true, name: true, metaCampaignId: true, status: true, isASC: true, createdAt: true },
+    }),
+    prisma.monthlyGoal.findMany({
+      where: { productId: product.id },
+      orderBy: { month: "desc" },
+      take: 3,
+    }),
+    prisma.actionLog.findMany({
+      where: { productId: product.id },
+      orderBy: { executedAt: "desc" },
+      take: 10,
+      select: { id: true, action: true, entityType: true, entityName: true, executedAt: true, source: true },
+    }),
+  ]);
+
+  let preflight: unknown = null;
+  try {
+    preflight = await runPreflightChecks(product.id);
+  } catch (err) {
+    preflight = { error: (err as Error).message };
+  }
+
+  res.json({
+    product,
+    automationConfig: product.automationConfig,
+    counts: product._count,
+    assets,
+    campaigns,
+    monthlyGoals,
+    lastActions,
+    preflight,
+  });
+});
+
 // POST /admin/upload-asset — upload multipart de criativo (imagem/video).
 // Replica o flow de /api/assets sem precisar de cookie. Eu uso pra subir
 // criativos do Matheus em massa. Dispara uploadAssetToMeta em background.
