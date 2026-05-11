@@ -340,6 +340,36 @@ router.patch("/settings/product/:id", async (req: Request, res: Response) => {
   }
 });
 
+// POST /admin/retry-asset-upload/:assetId — re-tenta upload de UM asset
+// específico pro Meta. Reusa a função uploadAssetToMeta() de produção
+// (não duplica lógica). Os 6 assets falharam quando metaAdAccountId era
+// NULL no GlobalSettings; agora que está cadastrado, dá pra retentar.
+// Não cria nada novo além do hash da imagem na Library da ad account.
+router.post("/retry-asset-upload/:assetId", async (req: Request, res: Response) => {
+  const assetId = String(req.params.assetId);
+  const prisma = (await import("../prisma")).default;
+  const asset = await prisma.productAsset.findUnique({ where: { id: assetId } });
+  if (!asset) {
+    res.status(404).json({ error: "asset_not_found" });
+    return;
+  }
+  try {
+    const { uploadAssetToMeta } = await import("../services/content-ingest");
+    const result = await uploadAssetToMeta(assetId);
+    const refreshed = await prisma.productAsset.findUnique({
+      where: { id: assetId },
+      select: { id: true, name: true, status: true, metaMediaId: true, error: true },
+    });
+    res.json({ result, asset: refreshed });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: (err as Error).message,
+      stack: (err as Error).stack?.slice(0, 400),
+    });
+  }
+});
+
 // GET /admin/planner-preview/:slugOrId — roda planner em dryRun (não cria nada
 // no Meta). Permite eu validar plano antes do owner approvar commit.
 router.get("/planner-preview/:slugOrId", async (req: Request, res: Response) => {
